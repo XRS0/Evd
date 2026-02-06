@@ -1,0 +1,37 @@
+services:
+  backend:
+    build: ./backend
+    ports:
+      - "8080:8080"
+    environment:
+      - TRANSMISSION_URL=http://transmission:9091/transmission/rpc
+      - TRANSMISSION_DOWNLOAD_DIR=/downloads
+      - HLS_SEGMENT_SECONDS=20
+    volumes:
+      - ./videos:/app/videos
+      - hls_data:/app/hls
+      - mp4_data:/app/mp4
+    depends_on:
+      - transmission
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+
+  transmission:
+    build: ./transmission
+    ports:
+      - "9091:9091"
+      - "51413:51413"
+      - "51413:51413/udp"
+    volumes:
+      - ./videos:/downloads
+      - transmission_config:/config
+
+volumes:
+  hls_data:
+  mp4_data:
+  transmission_config:

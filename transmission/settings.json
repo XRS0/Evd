@@ -1,0 +1,13 @@
+{
+  "download-dir": "/downloads",
+  "incomplete-dir-enabled": false,
+  "rpc-enabled": true,
+  "rpc-bind-address": "0.0.0.0",
+  "rpc-port": 9091,
+  "rpc-authentication-required": false,
+  "rpc-whitelist-enabled": false,
+  "rpc-whitelist": "",
+  "rpc-host-whitelist-enabled": false,
+  "rpc-host-whitelist": "",
+  "watch-dir-enabled": false
+}
