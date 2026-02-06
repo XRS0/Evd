@@ -1,8 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { NavLink, Outlet, Route, Routes, useLocation, useNavigate, useOutletContext, useParams } from 'react-router-dom'
 import brandImage from '../images/img.png'
+import { getOrCreateDeviceId, loadHistoryForDevice, mergeHistoryEntry, saveHistoryForDevice } from './watchHistory'
 
 const VIDEO_EXTS = ['mp4', 'mkv', 'avi', 'mov']
+const HISTORY_FLUSH_INTERVAL_MS = 2000
+const RESUME_GUARD_SECONDS = 1
 
 const ROUTE_META = [
   {
@@ -53,6 +56,17 @@ const formatDate = (unixSeconds) => {
     year: 'numeric',
     month: 'short',
     day: 'numeric'
+  })
+}
+
+const formatDateTime = (unixMs) => {
+  if (!unixMs) return '—'
+  return new Date(unixMs).toLocaleString(undefined, {
+    year: 'numeric',
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit'
   })
 }
 
@@ -259,6 +273,8 @@ function resolveInitialTheme() {
 
 function App() {
   const [theme, setTheme] = useState(resolveInitialTheme)
+  const [deviceId] = useState(getOrCreateDeviceId)
+  const [watchHistory, setWatchHistory] = useState(() => loadHistoryForDevice(deviceId))
   const [videos, setVideos] = useState([])
   const [activeVideo, setActiveVideo] = useState(null)
   const [playbackUrl, setPlaybackUrl] = useState('')
@@ -310,6 +326,27 @@ function App() {
   const toggleTheme = useCallback(() => {
     setTheme((value) => (value === 'dark' ? 'light' : 'dark'))
   }, [])
+
+  const watchHistoryByPath = useMemo(() => {
+    return new Map(
+      watchHistory.map((entry) => [normalizePath(entry.path), entry])
+    )
+  }, [watchHistory])
+
+  const updateWatchHistory = useCallback((entry) => {
+    if (!entry?.path) return
+    const nextEntry = {
+      ...entry,
+      path: normalizePath(entry.path),
+      title: entry.title || displayName(entry.path),
+      lastWatchedAt: Number.isFinite(entry.lastWatchedAt) ? entry.lastWatchedAt : Date.now()
+    }
+    setWatchHistory((prev) => mergeHistoryEntry(prev, nextEntry))
+  }, [])
+
+  useEffect(() => {
+    saveHistoryForDevice(deviceId, watchHistory)
+  }, [deviceId, watchHistory])
 
   useEffect(() => {
     if (!toast) return undefined
@@ -617,8 +654,12 @@ function App() {
       isActiveDownloading,
       libraryLoading,
       torrentLoading,
+      deviceId,
+      watchHistory,
+      watchHistoryByPath,
       videoInputRef,
       torrentInputRef,
+      updateWatchHistory,
       setPlayerError,
       setPlayerState,
       playVideo,
@@ -653,6 +694,10 @@ function App() {
       isActiveDownloading,
       libraryLoading,
       torrentLoading,
+      deviceId,
+      watchHistory,
+      watchHistoryByPath,
+      updateWatchHistory,
       playVideo,
       enableTorrentStreaming,
       handleVideoSelect,
@@ -743,12 +788,35 @@ function Layout({ contextValue }) {
 }
 
 function OverviewPage() {
-  const { videos, torrents, activeVideo, isActiveDownloading, activeTorrentFile, libraryLoading, torrentLoading } = useOutletContext()
+  const {
+    videos,
+    torrents,
+    activeVideo,
+    isActiveDownloading,
+    activeTorrentFile,
+    libraryLoading,
+    torrentLoading,
+    watchHistory,
+    playVideo
+  } = useOutletContext()
+  const navigate = useNavigate()
 
   const totalSize = useMemo(() => videos.reduce((acc, video) => acc + (video.size || 0), 0), [videos])
   const activeTorrentCount = useMemo(() => torrents.filter((torrent) => !torrent.isFinished).length, [torrents])
   const downloadRate = useMemo(() => torrents.reduce((acc, torrent) => acc + (torrent.rateDownload || 0), 0), [torrents])
   const latestVideo = videos[0]
+  const recentHistory = useMemo(() => watchHistory.slice(0, 8), [watchHistory])
+  const videoMap = useMemo(
+    () => new Map(videos.map((video) => [normalizePath(video.path), video])),
+    [videos]
+  )
+
+  const handleResume = useCallback(async (path) => {
+    const target = videoMap.get(normalizePath(path))
+    if (!target) return
+    await playVideo(target)
+    navigate('/player')
+  }, [navigate, playVideo, videoMap])
 
   return (
     <div className="stack-lg">
@@ -803,6 +871,34 @@ function OverviewPage() {
           )}
         </SectionCard>
       </div>
+
+      <SectionCard title="Watch history" subtitle="Continue from saved position">
+        {recentHistory.length === 0 ? (
+          <EmptyState title="No history yet" description="Start playing any video to save progress." compact />
+        ) : (
+          <div className="stack-md">
+            {recentHistory.map((entry) => {
+              const available = videoMap.has(normalizePath(entry.path))
+              return (
+                <div key={entry.path} className="inline-item">
+                  <div className="text-break">
+                    <strong>{entry.title || displayName(entry.path)}</strong>
+                    <p>{formatTime(entry.currentTime)} / {formatTime(entry.duration)} · {formatDateTime(entry.lastWatchedAt)}</p>
+                  </div>
+                  <div className="toolbar-actions">
+                    <NavLink className="inline-link" to={`/library/${encodePath(entry.path)}`}>
+                      Details
+                    </NavLink>
+                    <Button type="button" size="sm" onClick={() => handleResume(entry.path)} disabled={!available}>
+                      {available ? `Continue ${formatTime(entry.currentTime)}` : 'Unavailable'}
+                    </Button>
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+        )}
+      </SectionCard>
     </div>
   )
 }
@@ -955,10 +1051,11 @@ function LibraryIndex() {
 function LibraryDetail() {
   const { id } = useParams()
   const navigate = useNavigate()
-  const { videos, playVideo, activeVideo } = useOutletContext()
+  const { videos, playVideo, activeVideo, watchHistoryByPath } = useOutletContext()
 
   const decoded = decodePath(id)
   const video = videos.find((item) => item.path === decoded)
+  const historyEntry = video ? watchHistoryByPath.get(normalizePath(video.path)) : null
 
   if (!video) {
     return (
@@ -990,7 +1087,11 @@ function LibraryDetail() {
             Close
           </Button>
           <Button type="button" variant="primary" size="sm" onClick={handlePlay}>
-            {activeVideo?.path === video.path ? 'Continue' : 'Play'}
+            {historyEntry?.currentTime > 0
+              ? `Continue ${formatTime(historyEntry.currentTime)}`
+              : activeVideo?.path === video.path
+                ? 'Continue'
+                : 'Play'}
           </Button>
         </div>
       </div>
@@ -1007,6 +1108,18 @@ function LibraryDetail() {
         <div className="detail-cell">
           <span>Last modified</span>
           <strong>{formatDate(video.modifiedAt)}</strong>
+        </div>
+        <div className="detail-cell">
+          <span>Progress</span>
+          <strong>
+            {historyEntry
+              ? `${formatTime(historyEntry.currentTime)} / ${formatTime(historyEntry.duration)}`
+              : 'Not started'}
+          </strong>
+        </div>
+        <div className="detail-cell">
+          <span>Last watched</span>
+          <strong>{historyEntry ? formatDateTime(historyEntry.lastWatchedAt) : '—'}</strong>
         </div>
       </div>
     </div>
@@ -1162,13 +1275,54 @@ function PlayerPage() {
     isActiveDownloading,
     activeTorrentFile,
     setPlaybackUrl,
-    vodState
+    vodState,
+    watchHistoryByPath,
+    updateWatchHistory
   } = useOutletContext()
 
   const [retrySeed, setRetrySeed] = useState(0)
   const [duration, setDuration] = useState(0)
   const [currentTime, setCurrentTime] = useState(0)
   const videoRef = useRef(null)
+  const lastHistorySaveRef = useRef(0)
+  const resumePositionRef = useRef(0)
+
+  const historyEntry = useMemo(() => {
+    if (!activeVideo?.path) return null
+    return watchHistoryByPath.get(normalizePath(activeVideo.path)) || null
+  }, [activeVideo?.path, watchHistoryByPath])
+
+  useEffect(() => {
+    if (!activeVideo?.path) {
+      resumePositionRef.current = 0
+      return
+    }
+
+    const entry = watchHistoryByPath.get(normalizePath(activeVideo.path))
+    resumePositionRef.current = Number.isFinite(entry?.currentTime) ? entry.currentTime : 0
+  }, [activeVideo?.path])
+
+  const persistWatchProgress = useCallback((video, { force = false } = {}) => {
+    if (!activeVideo?.path || !video) return
+    const now = Date.now()
+
+    if (!force && now - lastHistorySaveRef.current < HISTORY_FLUSH_INTERVAL_MS) {
+      return
+    }
+
+    const nextCurrentTime = Number.isFinite(video.currentTime) && video.currentTime >= 0 ? video.currentTime : 0
+    const nextDuration = Number.isFinite(video.duration) && video.duration > 0 ? video.duration : 0
+
+    updateWatchHistory({
+      path: activeVideo.path,
+      title: displayName(activeVideo.path),
+      currentTime: nextCurrentTime,
+      duration: nextDuration,
+      lastWatchedAt: now
+    })
+
+    lastHistorySaveRef.current = now
+  }, [activeVideo?.path, updateWatchHistory])
 
   const handleRetry = useCallback(() => {
     if (!activeVideo?.path) return
@@ -1196,6 +1350,7 @@ function PlayerPage() {
     if (!playbackUrl) return undefined
     const video = videoRef.current
     if (!video) return undefined
+    const resumeTime = resumePositionRef.current
 
     setPlayerError('')
     setPlayerState('connecting')
@@ -1203,48 +1358,78 @@ function PlayerPage() {
     const onWaiting = () => setPlayerState('buffering')
     const onCanPlay = () => setPlayerState('ready')
     const onPlaying = () => setPlayerState('playing')
-    const onEnded = () => setPlayerState('idle')
+    const onEnded = () => {
+      setPlayerState('idle')
+      persistWatchProgress(video, { force: true })
+    }
     const onDuration = () => {
       const nextDuration = Number.isFinite(video.duration) ? video.duration : 0
       setDuration(nextDuration > 0 ? nextDuration : 0)
     }
     const onTimeUpdate = () => {
       setCurrentTime(video.currentTime || 0)
+      persistWatchProgress(video)
+    }
+    const onPause = () => persistWatchProgress(video, { force: true })
+    const onLoadedMetadata = () => {
+      onDuration()
+
+      const nextDuration = Number.isFinite(video.duration) ? video.duration : 0
+      const seekMax = nextDuration > RESUME_GUARD_SECONDS ? nextDuration - RESUME_GUARD_SECONDS : nextDuration
+      const resumeAt = Math.min(resumeTime, seekMax)
+
+      if (resumeAt > RESUME_GUARD_SECONDS) {
+        video.currentTime = resumeAt
+        setCurrentTime(resumeAt)
+      }
     }
     const onError = () => {
       setPlayerState('error')
       setPlayerError('Playback error. Try reconnecting.')
     }
+    const onBeforeUnload = () => persistWatchProgress(video, { force: true })
 
     video.addEventListener('waiting', onWaiting)
     video.addEventListener('stalled', onWaiting)
     video.addEventListener('canplay', onCanPlay)
     video.addEventListener('playing', onPlaying)
     video.addEventListener('ended', onEnded)
-    video.addEventListener('loadedmetadata', onDuration)
+    video.addEventListener('pause', onPause)
+    video.addEventListener('loadedmetadata', onLoadedMetadata)
     video.addEventListener('durationchange', onDuration)
     video.addEventListener('timeupdate', onTimeUpdate)
     video.addEventListener('error', onError)
+    window.addEventListener('beforeunload', onBeforeUnload)
 
     video.load()
     video.play().catch(() => {})
 
     return () => {
+      persistWatchProgress(video, { force: true })
       video.removeEventListener('waiting', onWaiting)
       video.removeEventListener('stalled', onWaiting)
       video.removeEventListener('canplay', onCanPlay)
       video.removeEventListener('playing', onPlaying)
       video.removeEventListener('ended', onEnded)
-      video.removeEventListener('loadedmetadata', onDuration)
+      video.removeEventListener('pause', onPause)
+      video.removeEventListener('loadedmetadata', onLoadedMetadata)
       video.removeEventListener('durationchange', onDuration)
       video.removeEventListener('timeupdate', onTimeUpdate)
       video.removeEventListener('error', onError)
+      window.removeEventListener('beforeunload', onBeforeUnload)
     }
-  }, [playbackUrl, retrySeed, setPlayerError, setPlayerState])
+  }, [
+    persistWatchProgress,
+    playbackUrl,
+    retrySeed,
+    setPlayerError,
+    setPlayerState
+  ])
 
   useEffect(() => {
     setCurrentTime(0)
     setDuration(0)
+    lastHistorySaveRef.current = 0
   }, [activeVideo?.path, playbackUrl])
 
   const modeLabel = useMemo(() => {
@@ -1402,6 +1587,9 @@ function PlayerPage() {
         </div>
 
         <div className="status-list">
+          {historyEntry?.currentTime > 0 && activeVideo && (
+            <div className="status-item">Resume point {formatTime(historyEntry.currentTime)}</div>
+          )}
           {!canSeek && activeVideo && (
             <div className="status-item">Seek is unavailable until timeline metadata is ready.</div>
           )}
@@ -1423,7 +1611,7 @@ function PlayerPage() {
 }
 
 function SettingsPage() {
-  const { torrentEnabled, torrentError, theme, toggleTheme } = useOutletContext()
+  const { torrentEnabled, torrentError, theme, toggleTheme, deviceId, watchHistory } = useOutletContext()
 
   return (
     <div className="grid-two">
@@ -1440,6 +1628,13 @@ function SettingsPage() {
         <Badge tone={torrentEnabled && !torrentError ? 'success' : 'danger'}>
           {torrentEnabled && !torrentError ? 'Online' : 'Offline'}
         </Badge>
+      </SectionCard>
+
+      <SectionCard title="Watch history">
+        <ul className="detail-list">
+          <li>Device ID: <span className="text-break">{deviceId}</span></li>
+          <li>Saved items: {watchHistory.length}</li>
+        </ul>
       </SectionCard>
     </div>
   )
