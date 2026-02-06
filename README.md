@@ -71,3 +71,7 @@ export TRANSMISSION_DOWNLOAD_DIR=/downloads
 - `cmd/server` — composition root
 
 Подробная схема: `backend/ARCHITECTURE.md`.
+
+## Git Flow
+
+Рабочий процесс ветвления описан в `GIT_FLOW.md`.
