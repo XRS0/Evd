@@ -5,6 +5,9 @@
 # Logs
 *.log
 
+# Docs
+GIT_FLOW.md
+
 # Environment
 .env
 .env.*
@@ -18,6 +21,7 @@ backend/server
 backend/videos/
 backend/hls/
 backend/mp4/
+videos/
 
 # Editor/IDE
 .idea/

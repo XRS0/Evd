@@ -738,8 +738,9 @@ h3,
   border: 1px solid var(--line-strong);
   border-radius: var(--radius-md);
   background: #000000;
-  min-height: clamp(150px, 30dvh, 300px);
-  height: clamp(150px, 30dvh, 300px);
+  width: 100%;
+  min-height: clamp(220px, 44dvh, 560px);
+  height: clamp(220px, 44dvh, 560px);
   overflow: hidden;
   display: flex;
   align-items: center;
@@ -1088,8 +1089,8 @@ h3,
   }
 
   .video-shell {
-    min-height: clamp(140px, 28dvh, 210px);
-    height: clamp(140px, 28dvh, 210px);
+    min-height: clamp(180px, 36dvh, 320px);
+    height: clamp(180px, 36dvh, 320px);
   }
 
   .toast-stack {
@@ -1127,8 +1128,8 @@ h3,
   }
 
   .video-shell {
-    min-height: 130px;
-    height: 130px;
+    min-height: clamp(150px, 32dvh, 240px);
+    height: clamp(150px, 32dvh, 240px);
   }
 }
 
@@ -1139,8 +1140,8 @@ h3,
   }
 
   .video-shell {
-    min-height: 120px;
-    height: 120px;
+    min-height: clamp(140px, 30dvh, 220px);
+    height: clamp(140px, 30dvh, 220px);
   }
 }
 

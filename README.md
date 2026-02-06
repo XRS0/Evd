@@ -17,6 +17,12 @@
 docker compose up --build
 ```
 
+Если нужно хранить скачанные видео в конкретной локальной папке, укажите bind path через переменную `MEDIA_DIR`:
+
+```bash
+MEDIA_DIR=./videos docker compose up --build
+```
+
 Фронтенд: http://localhost:3000
 
 ### Backend
@@ -52,6 +58,7 @@ npm run dev
 - В интерфейсе можно загрузить `.torrent` файл.
 - При запуске через Docker, Transmission скачивает файлы в `./videos`, и они появляются в библиотеке.
 - Прогресс скачивания отображается в секции Torrents.
+- Настройки Transmission берутся из `transmission/settings.json` (файл проброшен в контейнер).
 
 Если вы запускаете backend без Docker, укажите адрес Transmission:
 

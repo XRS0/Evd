@@ -1,6 +1,7 @@
 {
   "download-dir": "/downloads",
   "incomplete-dir-enabled": false,
+  "rename-partial-files": false,
   "rpc-enabled": true,
   "rpc-bind-address": "0.0.0.0",
   "rpc-port": 9091,

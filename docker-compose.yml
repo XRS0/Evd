@@ -8,7 +8,7 @@ services:
       - TRANSMISSION_DOWNLOAD_DIR=/downloads
       - HLS_SEGMENT_SECONDS=20
     volumes:
-      - ./videos:/app/videos
+      - ${MEDIA_DIR:-./videos}:/app/videos
       - hls_data:/app/hls
       - mp4_data:/app/mp4
     depends_on:
@@ -23,13 +23,15 @@ services:
 
   transmission:
     build: ./transmission
+    command: ["transmission-daemon", "-f", "-g", "/config", "-w", "/downloads"]
     ports:
       - "9091:9091"
       - "51413:51413"
       - "51413:51413/udp"
     volumes:
-      - ./videos:/downloads
+      - ${MEDIA_DIR:-./videos}:/downloads
       - transmission_config:/config
+      - ./transmission/settings.json:/config/settings.json
 
 volumes:
   hls_data:
