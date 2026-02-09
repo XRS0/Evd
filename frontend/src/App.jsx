@@ -6,6 +6,7 @@ import { getOrCreateDeviceId, loadHistoryForDevice, mergeHistoryEntry, saveHisto
 const VIDEO_EXTS = ['mp4', 'mkv', 'avi', 'mov']
 const HISTORY_FLUSH_INTERVAL_MS = 2000
 const RESUME_GUARD_SECONDS = 1
+const SEEK_STEP_SECONDS = 10
 
 const ROUTE_META = [
   {
@@ -137,6 +138,20 @@ const getParentPath = (value = '') => {
   const index = normalized.lastIndexOf('/')
   if (index <= 0) return ''
   return normalized.slice(0, index)
+}
+
+const isEditableTarget = (target) => {
+  if (!(target instanceof Element)) return false
+  const tagName = target.tagName.toLowerCase()
+  return tagName === 'input' || tagName === 'textarea' || tagName === 'select' || target.isContentEditable
+}
+
+const isVideoFullscreen = (video) => {
+  if (!video) return false
+  if (document.fullscreenElement) {
+    return document.fullscreenElement === video || document.fullscreenElement.contains(video)
+  }
+  return Boolean(video.webkitDisplayingFullscreen)
 }
 
 const encodePath = (value = '') => {
@@ -805,7 +820,7 @@ function OverviewPage() {
   const activeTorrentCount = useMemo(() => torrents.filter((torrent) => !torrent.isFinished).length, [torrents])
   const downloadRate = useMemo(() => torrents.reduce((acc, torrent) => acc + (torrent.rateDownload || 0), 0), [torrents])
   const latestVideo = videos[0]
-  const recentHistory = useMemo(() => watchHistory.slice(0, 8), [watchHistory])
+  const recentHistory = useMemo(() => watchHistory.slice(0, 4), [watchHistory])
   const videoMap = useMemo(
     () => new Map(videos.map((video) => [normalizePath(video.path), video])),
     [videos]
@@ -1483,21 +1498,63 @@ function PlayerPage() {
   }, [episodeIndex, episodeList, playVideo])
 
   const canSeek = Number.isFinite(duration) && duration > 0
-  const timelineMax = canSeek ? duration : 0
-  const timelineValue = canSeek ? Math.min(currentTime, timelineMax) : 0
+  const seekMax = canSeek ? duration : 0
+  const seekValue = canSeek ? Math.min(currentTime, seekMax) : 0
 
   const handleSeekTo = useCallback((nextValue) => {
     const video = videoRef.current
     if (!video || !canSeek) return
-    const next = Math.min(Math.max(nextValue, 0), timelineMax)
+    const next = Math.min(Math.max(nextValue, 0), seekMax)
     video.currentTime = next
     setCurrentTime(next)
-  }, [canSeek, timelineMax])
+  }, [canSeek, seekMax])
 
   const handleSeekBy = useCallback((delta) => {
     if (!canSeek) return
     handleSeekTo((videoRef.current?.currentTime || 0) + delta)
   }, [canSeek, handleSeekTo])
+
+  useEffect(() => {
+    const onKeyDown = (event) => {
+      if (event.defaultPrevented || event.altKey || event.metaKey || event.ctrlKey) return
+      if (isEditableTarget(event.target)) return
+
+      const video = videoRef.current
+      if (!video || !activeVideo) return
+
+      if (event.key === 'f' || event.key === 'F') {
+        event.preventDefault()
+        if (isVideoFullscreen(video)) {
+          if (document.exitFullscreen) {
+            document.exitFullscreen().catch(() => {})
+          } else if (document.webkitExitFullscreen) {
+            document.webkitExitFullscreen()
+          }
+          return
+        }
+
+        if (video.requestFullscreen) {
+          video.requestFullscreen().catch(() => {})
+        } else if (video.webkitEnterFullscreen) {
+          video.webkitEnterFullscreen()
+        }
+        return
+      }
+
+      if (!isVideoFullscreen(video)) return
+
+      if (event.key === 'ArrowLeft') {
+        event.preventDefault()
+        handleSeekBy(-SEEK_STEP_SECONDS)
+      } else if (event.key === 'ArrowRight') {
+        event.preventDefault()
+        handleSeekBy(SEEK_STEP_SECONDS)
+      }
+    }
+
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [activeVideo, handleSeekBy])
 
   return (
     <div className="player-layout">
@@ -1516,25 +1573,14 @@ function PlayerPage() {
       >
         <div className="player-controls">
           <div className="player-timeline-head">
-            <span>{formatTime(timelineValue)}</span>
-            <span>{formatTime(timelineMax)}</span>
+            <span>{formatTime(seekValue)}</span>
+            <span>{formatTime(seekMax)}</span>
           </div>
-          <input
-            className="player-timeline"
-            type="range"
-            min={0}
-            max={timelineMax || 0}
-            step={0.1}
-            value={timelineValue}
-            onChange={(event) => handleSeekTo(Number(event.target.value))}
-            disabled={!canSeek || !activeVideo}
-            aria-label="Seek timeline"
-          />
           <div className="player-timeline-actions">
-            <Button type="button" size="sm" onClick={() => handleSeekBy(-10)} disabled={!canSeek || !activeVideo}>
+            <Button type="button" size="sm" onClick={() => handleSeekBy(-SEEK_STEP_SECONDS)} disabled={!canSeek || !activeVideo}>
               -10s
             </Button>
-            <Button type="button" size="sm" onClick={() => handleSeekBy(10)} disabled={!canSeek || !activeVideo}>
+            <Button type="button" size="sm" onClick={() => handleSeekBy(SEEK_STEP_SECONDS)} disabled={!canSeek || !activeVideo}>
               +10s
             </Button>
           </div>
@@ -1591,7 +1637,10 @@ function PlayerPage() {
             <div className="status-item">Resume point {formatTime(historyEntry.currentTime)}</div>
           )}
           {!canSeek && activeVideo && (
-            <div className="status-item">Seek is unavailable until timeline metadata is ready.</div>
+            <div className="status-item">Seek is unavailable until metadata is ready.</div>
+          )}
+          {activeVideo && (
+            <div className="status-item">Shortcuts: F fullscreen, Arrow Left/Right seek ±10s in fullscreen.</div>
           )}
           {vodState.status === 'preparing' && (
             <div className="status-item">Direct: preparing MP4 stream... {vodState.progress > 0 ? `${formatPercent(vodState.progress)}` : ''}</div>

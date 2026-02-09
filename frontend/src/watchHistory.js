@@ -1,6 +1,6 @@
 const DEVICE_ID_COOKIE_NAME = 'evd_device_id'
 const HISTORY_STORAGE_PREFIX = 'evd_watch_history'
-const HISTORY_LIMIT = 200
+const HISTORY_LIMIT = 4
 
 const DEFAULT_COOKIE_MAX_AGE_SECONDS = 60 * 60 * 24 * 365 * 3
 
