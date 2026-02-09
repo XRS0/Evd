@@ -7,8 +7,10 @@ import (
 	"net/http"
 	"time"
 
+	"evd/internal/application/auth"
 	"evd/internal/application/media"
 	"evd/internal/application/torrent"
+	"evd/internal/application/watchparty"
 	"evd/internal/config"
 	"evd/internal/infrastructure/ffmpeg"
 	"evd/internal/infrastructure/filesystem"
@@ -35,7 +37,13 @@ func main() {
 	transmissionClient := transmission.NewClient(cfg.TransmissionURL, cfg.TransmissionUser, cfg.TransmissionPass, cfg.TransmissionDownloadDir, store)
 	torrentService := torrent.NewService(transmissionClient)
 
-	handler := httptransport.NewHandler(mediaService, torrentService, store)
+	authService, err := auth.NewService(cfg.UsersFile, time.Duration(cfg.SessionTTLHours)*time.Hour)
+	if err != nil {
+		log.Fatalf("auth init failed: %v", err)
+	}
+	watchPartyService := watchparty.NewService()
+
+	handler := httptransport.NewHandler(mediaService, torrentService, store, authService, watchPartyService)
 	router := httptransport.NewRouter(handler, cfg.HLSDir)
 
 	c := cors.New(cors.Options{

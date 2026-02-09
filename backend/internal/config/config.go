@@ -12,6 +12,8 @@ type Config struct {
 	VideosDir               string
 	HLSDir                  string
 	MP4Dir                  string
+	UsersFile               string
+	SessionTTLHours         int
 	TransmissionURL         string
 	TransmissionUser        string
 	TransmissionPass        string
@@ -26,6 +28,8 @@ func Load() Config {
 		VideosDir:               getEnv("VIDEOS_DIR", "./videos"),
 		HLSDir:                  getEnv("HLS_DIR", "./hls"),
 		MP4Dir:                  getEnv("MP4_DIR", "./mp4"),
+		UsersFile:               getEnv("USERS_FILE", "./data/users.json"),
+		SessionTTLHours:         getEnvInt("SESSION_TTL_HOURS", 72),
 		TransmissionURL:         strings.TrimSpace(os.Getenv("TRANSMISSION_URL")),
 		TransmissionUser:        os.Getenv("TRANSMISSION_USER"),
 		TransmissionPass:        os.Getenv("TRANSMISSION_PASS"),

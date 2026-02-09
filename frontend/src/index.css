@@ -63,6 +63,75 @@ body {
   overflow-y: auto;
 }
 
+.auth-shell {
+  min-height: 100dvh;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+}
+
+.auth-surface {
+  width: min(620px, 100%);
+  display: grid;
+  gap: 12px;
+}
+
+.auth-head {
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  padding: 12px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+
+.auth-form {
+  display: grid;
+  gap: 10px;
+}
+
+.auth-field {
+  display: grid;
+  gap: 5px;
+}
+
+.auth-field span {
+  color: var(--muted);
+  font-size: 0.66rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  font-family: 'IBM Plex Mono', monospace;
+}
+
+.auth-field input,
+.auth-field select {
+  min-height: 34px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface-3);
+  color: var(--ink);
+  padding: 0 10px;
+  font-size: 0.74rem;
+}
+
+.auth-field input:focus-visible,
+.auth-field select:focus-visible {
+  outline: none;
+  box-shadow: var(--focus);
+}
+
+.auth-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.auth-error {
+  border-color: var(--danger);
+}
+
 button,
 input,
 select,
@@ -678,6 +747,13 @@ h3,
   gap: 10px;
 }
 
+.watch-hub-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 8px;
+  align-items: end;
+}
+
 .player-controls,
 .episode-switcher {
   border: 1px solid var(--line-strong);
@@ -1041,6 +1117,16 @@ h3,
     gap: 8px;
   }
 
+  .auth-shell {
+    padding: 8px;
+  }
+
+  .auth-head {
+    padding: 9px;
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
   .card,
   .sidebar,
   .page-header,
@@ -1072,6 +1158,19 @@ h3,
   .card-actions {
     width: 100%;
     justify-content: flex-start;
+  }
+
+  .watch-hub-grid {
+    grid-template-columns: 1fr;
+    align-items: stretch;
+  }
+
+  .auth-actions {
+    width: 100%;
+  }
+
+  .auth-actions .btn {
+    width: 100%;
   }
 
   .episode-switcher-row {
