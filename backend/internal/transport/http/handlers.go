@@ -58,6 +58,7 @@ type watchPartyUseCases interface {
 	GetHub(hubID string) (watchpartyapp.Snapshot, error)
 	Subscribe(hubID, userID, username string) (<-chan watchpartyapp.Event, func(), error)
 	Control(hubID, userID, username string, input watchpartyapp.ControlInput) (watchpartyapp.Event, error)
+	Chat(hubID, userID, username, text string) (watchpartyapp.Event, error)
 }
 
 type Handler struct {
@@ -618,6 +619,39 @@ func (h *Handler) ControlWatchHub(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// SendWatchHubChat appends a chat message into the hub.
+func (h *Handler) SendWatchHubChat(w http.ResponseWriter, r *http.Request) {
+	user, ok := requestUser(r)
+	if !ok {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	hubID := strings.TrimSpace(mux.Vars(r)["id"])
+	var payload watchHubChatRequest
+	if err := decodeJSON(r, &payload); err != nil {
+		http.Error(w, "Invalid payload", http.StatusBadRequest)
+		return
+	}
+
+	event, err := h.watch.Chat(hubID, user.ID, user.Username, payload.Text)
+	if err != nil {
+		switch {
+		case errors.Is(err, watchpartyapp.ErrHubNotFound):
+			http.Error(w, err.Error(), http.StatusNotFound)
+		case errors.Is(err, watchpartyapp.ErrInvalidInput):
+			http.Error(w, err.Error(), http.StatusBadRequest)
+		default:
+			http.Error(w, "Unable to send chat message", http.StatusInternalServerError)
+		}
+		return
+	}
+
+	writeJSON(w, map[string]interface{}{
+		"event": event,
+	})
+}
+
 // WatchHubEvents streams SSE updates for a hub.
 func (h *Handler) WatchHubEvents(w http.ResponseWriter, r *http.Request) {
 	user, ok := requestUser(r)
@@ -765,4 +799,8 @@ type watchHubControlRequest struct {
 	VideoPath   string  `json:"videoPath"`
 	CurrentTime float64 `json:"currentTime"`
 	Playing     *bool   `json:"playing"`
+}
+
+type watchHubChatRequest struct {
+	Text string `json:"text"`
 }

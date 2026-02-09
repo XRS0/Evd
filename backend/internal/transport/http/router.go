@@ -31,6 +31,7 @@ func NewRouter(handler *Handler, hlsDir string) *mux.Router {
 	api.HandleFunc("/watch-hubs", handler.CreateWatchHub).Methods("POST")
 	api.HandleFunc("/watch-hubs/{id}", handler.GetWatchHub).Methods("GET")
 	api.HandleFunc("/watch-hubs/{id}/control", handler.ControlWatchHub).Methods("POST")
+	api.HandleFunc("/watch-hubs/{id}/chat", handler.SendWatchHubChat).Methods("POST")
 	api.HandleFunc("/watch-hubs/{id}/events", handler.WatchHubEvents).Methods("GET")
 
 	hls := r.PathPrefix("/hls/").Subrouter()

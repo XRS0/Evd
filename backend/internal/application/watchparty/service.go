@@ -16,6 +16,7 @@ const (
 	ActionPause = "pause"
 	ActionSeek  = "seek"
 	ActionVideo = "video"
+	ActionChat  = "chat"
 )
 
 var (
@@ -23,6 +24,8 @@ var (
 	ErrInvalidHubID = errors.New("invalid hub id")
 	ErrInvalidInput = errors.New("invalid control payload")
 )
+
+const maxChatMessages = 200
 
 // ControlInput is a player update pushed by a participant.
 type ControlInput struct {
@@ -40,23 +43,34 @@ type Member struct {
 
 // Snapshot contains the current shared playback state.
 type Snapshot struct {
-	ID          string   `json:"id"`
-	OwnerID     string   `json:"ownerId"`
-	OwnerName   string   `json:"ownerName"`
-	VideoPath   string   `json:"videoPath"`
-	CurrentTime float64  `json:"currentTime"`
-	Playing     bool     `json:"playing"`
-	UpdatedAt   int64    `json:"updatedAt"`
-	Members     []Member `json:"members"`
+	ID          string        `json:"id"`
+	OwnerID     string        `json:"ownerId"`
+	OwnerName   string        `json:"ownerName"`
+	VideoPath   string        `json:"videoPath"`
+	CurrentTime float64       `json:"currentTime"`
+	Playing     bool          `json:"playing"`
+	UpdatedAt   int64         `json:"updatedAt"`
+	Members     []Member      `json:"members"`
+	Messages    []ChatMessage `json:"messages"`
+}
+
+// ChatMessage stores a text entry inside a watch hub.
+type ChatMessage struct {
+	ID        string `json:"id"`
+	UserID    string `json:"userId"`
+	Username  string `json:"username"`
+	Text      string `json:"text"`
+	CreatedAt int64  `json:"createdAt"`
 }
 
 // Event is emitted to subscribers via SSE.
 type Event struct {
-	Type      string   `json:"type"`
-	Action    string   `json:"action,omitempty"`
-	ActorID   string   `json:"actorId,omitempty"`
-	ActorName string   `json:"actorName,omitempty"`
-	Hub       Snapshot `json:"hub"`
+	Type      string       `json:"type"`
+	Action    string       `json:"action,omitempty"`
+	ActorID   string       `json:"actorId,omitempty"`
+	ActorName string       `json:"actorName,omitempty"`
+	Chat      *ChatMessage `json:"chat,omitempty"`
+	Hub       Snapshot     `json:"hub"`
 }
 
 type hub struct {
@@ -71,6 +85,7 @@ type hub struct {
 
 	memberRefs map[string]int
 	memberInfo map[string]string
+	messages   []ChatMessage
 
 	subscribers map[string]chan Event
 }
@@ -113,6 +128,7 @@ func (s *Service) CreateHub(ownerID, ownerName, videoPath string, currentTime fl
 		UpdatedAt:   now,
 		memberRefs:  map[string]int{},
 		memberInfo:  map[string]string{},
+		messages:    []ChatMessage{},
 		subscribers: map[string]chan Event{},
 	}
 
@@ -290,6 +306,60 @@ func (s *Service) Control(hubID, userID, username string, input ControlInput) (E
 	return event, nil
 }
 
+// Chat appends a chat message and broadcasts it.
+func (s *Service) Chat(hubID, userID, username, text string) (Event, error) {
+	hubID = strings.TrimSpace(hubID)
+	userID = strings.TrimSpace(userID)
+	username = strings.TrimSpace(username)
+	text = strings.TrimSpace(text)
+	if hubID == "" || userID == "" || username == "" || text == "" {
+		return Event{}, ErrInvalidInput
+	}
+	if len(text) > 600 {
+		return Event{}, ErrInvalidInput
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	h, ok := s.hubs[hubID]
+	if !ok {
+		return Event{}, ErrHubNotFound
+	}
+
+	messageID, err := randomID(14)
+	if err != nil {
+		return Event{}, err
+	}
+
+	now := time.Now()
+	message := ChatMessage{
+		ID:        messageID,
+		UserID:    userID,
+		Username:  username,
+		Text:      text,
+		CreatedAt: now.UnixMilli(),
+	}
+
+	h.messages = append(h.messages, message)
+	if len(h.messages) > maxChatMessages {
+		h.messages = append([]ChatMessage(nil), h.messages[len(h.messages)-maxChatMessages:]...)
+	}
+	h.UpdatedAt = now
+
+	event := Event{
+		Type:      "chat",
+		Action:    ActionChat,
+		ActorID:   userID,
+		ActorName: username,
+		Chat:      &message,
+		Hub:       snapshotFromHub(h),
+	}
+	s.broadcastLocked(h, event)
+
+	return event, nil
+}
+
 func (s *Service) broadcastLocked(h *hub, event Event) {
 	for _, subscriber := range h.subscribers {
 		select {
@@ -315,6 +385,9 @@ func snapshotFromHub(h *hub) Snapshot {
 		})
 	}
 
+	messages := make([]ChatMessage, len(h.messages))
+	copy(messages, h.messages)
+
 	return Snapshot{
 		ID:          h.ID,
 		OwnerID:     h.OwnerID,
@@ -324,6 +397,7 @@ func snapshotFromHub(h *hub) Snapshot {
 		Playing:     h.Playing,
 		UpdatedAt:   h.UpdatedAt.UnixMilli(),
 		Members:     members,
+		Messages:    messages,
 	}
 }
 

@@ -754,6 +754,83 @@ h3,
   align-items: end;
 }
 
+.watch-chat-shell {
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-md);
+  background: var(--surface-2);
+  padding: 8px;
+  display: grid;
+  gap: 8px;
+}
+
+.watch-chat-list {
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  min-height: 120px;
+  max-height: 240px;
+  overflow-y: auto;
+  padding: 7px;
+  display: grid;
+  gap: 6px;
+}
+
+.watch-chat-item {
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  padding: 6px 7px;
+  display: grid;
+  gap: 4px;
+}
+
+.watch-chat-item.self {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.watch-chat-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.watch-chat-meta strong {
+  font-size: 0.67rem;
+}
+
+.watch-chat-meta span {
+  font-size: 0.62rem;
+  color: var(--muted);
+  font-family: 'IBM Plex Mono', monospace;
+}
+
+.watch-chat-text {
+  font-size: 0.73rem;
+  overflow-wrap: anywhere;
+}
+
+.watch-chat-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 7px;
+}
+
+.watch-chat-form input {
+  min-height: 30px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface-3);
+  color: var(--ink);
+  padding: 0 9px;
+  font-size: 0.72rem;
+}
+
+.watch-chat-form input:focus-visible {
+  outline: none;
+  box-shadow: var(--focus);
+}
+
 .player-controls,
 .episode-switcher {
   border: 1px solid var(--line-strong);
@@ -1163,6 +1240,10 @@ h3,
   .watch-hub-grid {
     grid-template-columns: 1fr;
     align-items: stretch;
+  }
+
+  .watch-chat-form {
+    grid-template-columns: 1fr;
   }
 
   .auth-actions {

@@ -160,6 +160,16 @@ const isVideoFullscreen = (video) => {
   return Boolean(video.webkitDisplayingFullscreen)
 }
 
+const isVideoSeekable = (video) => {
+  if (!video) return false
+  if (!Number.isFinite(video.duration) || video.duration <= 0) return false
+  try {
+    return Boolean(video.seekable && video.seekable.length > 0)
+  } catch (err) {
+    return false
+  }
+}
+
 const encodePath = (value = '') => {
   try {
     const encoded = btoa(encodeURIComponent(value))
@@ -1989,10 +1999,13 @@ function WatchTogetherPage() {
   const [hubBusy, setHubBusy] = useState(false)
   const [hubError, setHubError] = useState('')
   const [connectionState, setConnectionState] = useState('Disconnected')
+  const [chatInput, setChatInput] = useState('')
+  const [chatSending, setChatSending] = useState(false)
 
   const videoRef = useRef(null)
   const eventSourceRef = useRef(null)
   const suppressOutgoingRef = useRef(false)
+  const suppressTimerRef = useRef(null)
   const lastSeekBroadcastRef = useRef(0)
 
   const videoMap = useMemo(
@@ -2022,12 +2035,61 @@ function WatchTogetherPage() {
   useEffect(() => {
     return () => {
       closeHubStream()
+      if (suppressTimerRef.current) {
+        clearTimeout(suppressTimerRef.current)
+        suppressTimerRef.current = null
+      }
     }
   }, [closeHubStream])
 
-  const applyHubStateToPlayer = useCallback(async (state) => {
+  const markSuppressOutgoing = useCallback((ms = 1300) => {
+    suppressOutgoingRef.current = true
+    if (suppressTimerRef.current) {
+      clearTimeout(suppressTimerRef.current)
+    }
+    suppressTimerRef.current = setTimeout(() => {
+      suppressOutgoingRef.current = false
+      suppressTimerRef.current = null
+    }, ms)
+  }, [])
+
+  const waitForVideoElement = useCallback(async (timeoutMs = 5000) => {
+    const startedAt = Date.now()
+    while (Date.now() - startedAt < timeoutMs) {
+      if (videoRef.current) return videoRef.current
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    }
+    return null
+  }, [])
+
+  const ensureVideoMetadata = useCallback(async (video, timeoutMs = 5000) => {
+    if (!video) return false
+    if (video.readyState >= 1) return true
+
+    return await new Promise((resolve) => {
+      let settled = false
+      const finalize = (result) => {
+        if (settled) return
+        settled = true
+        video.removeEventListener('loadedmetadata', onLoadedMetadata)
+        video.removeEventListener('error', onError)
+        clearTimeout(timeoutID)
+        resolve(result)
+      }
+      const onLoadedMetadata = () => finalize(true)
+      const onError = () => finalize(false)
+      const timeoutID = setTimeout(() => finalize(false), timeoutMs)
+
+      video.addEventListener('loadedmetadata', onLoadedMetadata, { once: true })
+      video.addEventListener('error', onError, { once: true })
+    })
+  }, [])
+
+  const applyHubEventToPlayer = useCallback(async (eventPayload) => {
+    const state = eventPayload?.hub
     if (!state?.videoPath) return
 
+    const action = String(eventPayload?.action || eventPayload?.type || 'sync').toLowerCase()
     const normalizedPath = normalizePath(state.videoPath)
     if (normalizePath(activeVideo?.path || '') !== normalizedPath) {
       const target = videoMap.get(normalizedPath)
@@ -2038,39 +2100,52 @@ function WatchTogetherPage() {
       await playVideo(target)
     }
 
-    const video = videoRef.current
+    const video = await waitForVideoElement()
     if (!video) return
 
-    suppressOutgoingRef.current = true
-    try {
-      const desiredTime = Number.isFinite(state.currentTime) && state.currentTime >= 0 ? state.currentTime : 0
-      if (Math.abs((video.currentTime || 0) - desiredTime) > 0.8) {
-        const applyTime = () => {
-          try {
-            video.currentTime = desiredTime
-          } catch (err) {
-            // ignore seek timing race
-          }
-        }
+    markSuppressOutgoing(action === 'seek' ? 900 : 1600)
 
-        if (video.readyState >= 1) {
-          applyTime()
-        } else {
-          video.addEventListener('loadedmetadata', applyTime, { once: true })
-        }
+    const metadataReady = await ensureVideoMetadata(video)
+    const desiredTime = Number.isFinite(state.currentTime) && state.currentTime >= 0 ? state.currentTime : 0
+
+    if (metadataReady && isVideoSeekable(video) && Math.abs((video.currentTime || 0) - desiredTime) > 0.7) {
+      try {
+        video.currentTime = desiredTime
+      } catch (err) {
+        // ignore seek race when stream just switched
       }
+    } else if (!metadataReady && desiredTime > 0) {
+      video.addEventListener('loadedmetadata', () => {
+        try {
+          video.currentTime = desiredTime
+        } catch (err) {
+          // ignore delayed seek race
+        }
+      }, { once: true })
+    }
 
+    if (action === 'seek') {
+      return
+    }
+
+    if (action === 'play') {
+      await video.play().catch(() => {})
+      return
+    }
+
+    if (action === 'pause') {
+      video.pause()
+      return
+    }
+
+    if (action === 'video' || action === 'sync') {
       if (state.playing) {
         await video.play().catch(() => {})
       } else {
         video.pause()
       }
-    } finally {
-      window.setTimeout(() => {
-        suppressOutgoingRef.current = false
-      }, 260)
     }
-  }, [activeVideo?.path, playVideo, pushToast, videoMap])
+  }, [activeVideo?.path, ensureVideoMetadata, markSuppressOutgoing, playVideo, pushToast, videoMap, waitForVideoElement])
 
   const sendControl = useCallback(async (action, overrides = {}) => {
     if (!hubState?.id) return
@@ -2086,14 +2161,45 @@ function WatchTogetherPage() {
       payload.videoPath = overrides.videoPath
     }
 
-    await authedFetch(`/api/watch-hubs/${encodeURIComponent(hubState.id)}/control`, {
+    if (action === 'seek' && !Number.isFinite(payload.currentTime)) return
+
+    const res = await authedFetch(`/api/watch-hubs/${encodeURIComponent(hubState.id)}/control`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json'
       },
       body: JSON.stringify(payload)
     })
-  }, [authedFetch, hubState?.id])
+    if (!res.ok) {
+      pushToast('Failed to sync playback action.', 'error')
+    }
+  }, [authedFetch, hubState?.id, pushToast])
+
+  const sendChat = useCallback(async () => {
+    if (!hubState?.id) return
+    const text = chatInput.trim()
+    if (!text || chatSending) return
+
+    setChatSending(true)
+    try {
+      const res = await authedFetch(`/api/watch-hubs/${encodeURIComponent(hubState.id)}/chat`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ text })
+      })
+      if (!res.ok) {
+        pushToast(await readErrorMessage(res), 'error')
+        return
+      }
+      setChatInput('')
+    } catch (err) {
+      pushToast('Failed to send chat message.', 'error')
+    } finally {
+      setChatSending(false)
+    }
+  }, [authedFetch, chatInput, chatSending, hubState?.id, pushToast])
 
   const connectHubStream = useCallback((hubID) => {
     closeHubStream()
@@ -2113,9 +2219,10 @@ function WatchTogetherPage() {
         if (!nextHub) return
         setHubState(nextHub)
 
+        if (payload.type === 'chat') return
         if (payload.type === 'presence') return
         if (payload.type === 'control' && payload.actorId === authUser?.id) return
-        void applyHubStateToPlayer(nextHub)
+        void applyHubEventToPlayer(payload)
       } catch (err) {
         // ignore malformed message
       }
@@ -2124,7 +2231,7 @@ function WatchTogetherPage() {
     stream.onerror = () => {
       setConnectionState('Reconnecting...')
     }
-  }, [applyHubStateToPlayer, authUser?.id, closeHubStream])
+  }, [applyHubEventToPlayer, authUser?.id, closeHubStream])
 
   const joinHub = useCallback(async (hubID, options = {}) => {
     const normalizedHubID = extractHubID(hubID)
@@ -2149,7 +2256,7 @@ function WatchTogetherPage() {
 
       setHubState(nextHub)
       setHubInput(nextHub.id)
-      await applyHubStateToPlayer(nextHub)
+      await applyHubEventToPlayer({ type: 'sync', action: 'sync', hub: nextHub })
       connectHubStream(nextHub.id)
 
       if (!options.keepURL) {
@@ -2160,7 +2267,7 @@ function WatchTogetherPage() {
     } finally {
       setHubBusy(false)
     }
-  }, [applyHubStateToPlayer, authedFetch, connectHubStream, navigate])
+  }, [applyHubEventToPlayer, authedFetch, connectHubStream, navigate])
 
   const createHub = useCallback(async () => {
     const path = selectedPath || activeVideo?.path || ''
@@ -2220,6 +2327,7 @@ function WatchTogetherPage() {
     setHubState(null)
     setHubError('')
     setHubInput('')
+    setChatInput('')
     navigate('/watch-together', { replace: true })
   }, [closeHubStream, navigate])
 
@@ -2237,16 +2345,19 @@ function WatchTogetherPage() {
 
     const onPlay = () => {
       if (suppressOutgoingRef.current) return
+      if (!Number.isFinite(video.duration) || video.duration <= 0) return
       void sendControl('play', { currentTime: video.currentTime, playing: true })
     }
 
     const onPause = () => {
       if (suppressOutgoingRef.current) return
+      if (!Number.isFinite(video.duration) || video.duration <= 0) return
       void sendControl('pause', { currentTime: video.currentTime, playing: false })
     }
 
     const onSeeked = () => {
       if (suppressOutgoingRef.current) return
+      if (!isVideoSeekable(video)) return
       const now = Date.now()
       if (now - lastSeekBroadcastRef.current < 140) return
       lastSeekBroadcastRef.current = now
@@ -2265,6 +2376,7 @@ function WatchTogetherPage() {
   }, [hubState?.id, sendControl, playbackUrl])
 
   const hubMembers = hubState?.members || []
+  const hubMessages = hubState?.messages || []
 
   return (
     <div className="player-layout">
@@ -2364,6 +2476,47 @@ function WatchTogetherPage() {
           ) : (
             <EmptyState title="No active playback" description="Select a video and create or join a hub." compact />
           )}
+        </div>
+
+        <div className="watch-chat-shell">
+          <div className="player-timeline-head">
+            <span>Hub chat</span>
+            <span>{hubMessages.length}</span>
+          </div>
+          <div className="watch-chat-list" role="log" aria-live="polite">
+            {hubMessages.length === 0 ? (
+              <EmptyState title="No messages yet" description="Write first message for participants." compact />
+            ) : (
+              hubMessages.map((message) => (
+                <div key={message.id} className={cx('watch-chat-item', message.userId === authUser?.id && 'self')}>
+                  <div className="watch-chat-meta">
+                    <strong>{message.username}</strong>
+                    <span>{new Date(message.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+                  </div>
+                  <p className="watch-chat-text">{message.text}</p>
+                </div>
+              ))
+            )}
+          </div>
+          <form
+            className="watch-chat-form"
+            onSubmit={(event) => {
+              event.preventDefault()
+              void sendChat()
+            }}
+          >
+            <input
+              type="text"
+              value={chatInput}
+              onChange={(event) => setChatInput(event.target.value)}
+              placeholder={hubState?.id ? 'Type a message...' : 'Join hub to chat'}
+              maxLength={600}
+              disabled={!hubState?.id || chatSending}
+            />
+            <Button type="submit" size="sm" disabled={!hubState?.id || chatSending || !chatInput.trim()}>
+              Send
+            </Button>
+          </form>
         </div>
       </SectionCard>
     </div>
