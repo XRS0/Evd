@@ -932,6 +932,40 @@ function AuthPage({ theme, toggleTheme, onAuthenticated }) {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
 
+  const handleGuestLogin = useCallback(async () => {
+    if (loading) return
+
+    setLoading(true)
+    setError('')
+
+    try {
+      const res = await fetch('/api/auth/guest', {
+        method: 'POST',
+        credentials: 'include'
+      })
+
+      if (!res.ok) {
+        setError(await readErrorMessage(res))
+        return
+      }
+
+      const data = await readJsonSafe(res)
+      if (!data?.user) {
+        setError('Invalid server response.')
+        return
+      }
+
+      onAuthenticated(data.user)
+      setUsername('')
+      setPassword('')
+      setPasswordConfirm('')
+    } catch (err) {
+      setError('Authentication failed. Please try again.')
+    } finally {
+      setLoading(false)
+    }
+  }, [loading, onAuthenticated])
+
   const handleSubmit = useCallback(async (event) => {
     event.preventDefault()
     if (loading) return
@@ -987,7 +1021,7 @@ function AuthPage({ theme, toggleTheme, onAuthenticated }) {
 
   return (
     <AuthShell theme={theme} toggleTheme={toggleTheme}>
-      <SectionCard title={mode === 'register' ? 'Create account' : 'Sign in'} subtitle="Library is shared, but access now requires an account.">
+      <SectionCard title={mode === 'register' ? 'Create account' : 'Sign in'} subtitle="Library is shared. Use an account or continue as guest.">
         <form className="auth-form" onSubmit={handleSubmit}>
           <label className="auth-field">
             <span>Username</span>
@@ -1034,6 +1068,9 @@ function AuthPage({ theme, toggleTheme, onAuthenticated }) {
           <div className="auth-actions">
             <Button type="submit" variant="primary" disabled={loading}>
               {loading ? 'Please wait' : mode === 'register' ? 'Create account' : 'Login'}
+            </Button>
+            <Button type="button" variant="secondary" onClick={() => void handleGuestLogin()} disabled={loading}>
+              Continue as guest
             </Button>
             <Button
               type="button"

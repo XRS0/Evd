@@ -48,6 +48,7 @@ type mediaPathStore interface {
 type authUseCases interface {
 	Register(username, password string) (authapp.User, string, error)
 	Login(username, password string) (authapp.User, string, error)
+	LoginGuest() (authapp.User, string, error)
 	Authenticate(token string) (authapp.User, error)
 	Logout(token string)
 	SessionTTL() time.Duration
@@ -160,6 +161,20 @@ func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 		default:
 			http.Error(w, "Unable to login", http.StatusInternalServerError)
 		}
+		return
+	}
+
+	setSessionCookie(w, sessionToken, h.auth.SessionTTL())
+	writeJSON(w, map[string]interface{}{
+		"user": user,
+	})
+}
+
+// LoginGuest starts an anonymous guest session.
+func (h *Handler) LoginGuest(w http.ResponseWriter, _ *http.Request) {
+	user, sessionToken, err := h.auth.LoginGuest()
+	if err != nil {
+		http.Error(w, "Unable to login as guest", http.StatusInternalServerError)
 		return
 	}
 

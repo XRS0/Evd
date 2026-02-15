@@ -11,6 +11,7 @@ func NewRouter(handler *Handler, hlsDir string) *mux.Router {
 	r := mux.NewRouter()
 	r.HandleFunc("/api/auth/register", handler.Register).Methods("POST")
 	r.HandleFunc("/api/auth/login", handler.Login).Methods("POST")
+	r.HandleFunc("/api/auth/guest", handler.LoginGuest).Methods("POST")
 	r.HandleFunc("/api/auth/logout", handler.Logout).Methods("POST")
 	r.HandleFunc("/api/auth/me", handler.Me).Methods("GET")
 

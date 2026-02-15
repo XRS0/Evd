@@ -50,7 +50,7 @@ type storedUser struct {
 }
 
 type session struct {
-	UserID    string
+	User      User
 	ExpiresAt time.Time
 }
 
@@ -136,12 +136,13 @@ func (s *Service) Register(username, password string) (User, string, error) {
 		return User{}, "", err
 	}
 
-	token, err := s.createSessionLocked(userID)
+	publicUser := user.toPublic()
+	token, err := s.createSessionLocked(publicUser)
 	if err != nil {
 		return User{}, "", err
 	}
 
-	return user.toPublic(), token, nil
+	return publicUser, token, nil
 }
 
 // Login authenticates user credentials and returns a fresh session token.
@@ -166,12 +167,39 @@ func (s *Service) Login(username, password string) (User, string, error) {
 		return User{}, "", ErrInvalidCredentials
 	}
 
-	token, err := s.createSessionLocked(user.ID)
+	publicUser := user.toPublic()
+	token, err := s.createSessionLocked(publicUser)
 	if err != nil {
 		return User{}, "", err
 	}
 
-	return user.toPublic(), token, nil
+	return publicUser, token, nil
+}
+
+// LoginGuest creates an anonymous guest session without user registration.
+func (s *Service) LoginGuest() (User, string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.cleanupExpiredSessionsLocked(time.Now())
+
+	guestID, err := randomToken(userIDBytes)
+	if err != nil {
+		return User{}, "", err
+	}
+
+	guestUser := User{
+		ID:        "guest_" + guestID,
+		Username:  "guest",
+		CreatedAt: time.Now().UnixMilli(),
+	}
+
+	token, err := s.createSessionLocked(guestUser)
+	if err != nil {
+		return User{}, "", err
+	}
+
+	return guestUser, token, nil
 }
 
 // Authenticate resolves a session token into a user.
@@ -193,13 +221,12 @@ func (s *Service) Authenticate(token string) (User, error) {
 		return User{}, ErrUnauthorized
 	}
 
-	user, exists := s.usersByID[record.UserID]
-	if !exists {
+	if record.User.ID == "" {
 		delete(s.sessions, token)
 		return User{}, ErrUnauthorized
 	}
 
-	return user.toPublic(), nil
+	return record.User, nil
 }
 
 // Logout removes an active session token.
@@ -214,14 +241,14 @@ func (s *Service) Logout(token string) {
 	delete(s.sessions, token)
 }
 
-func (s *Service) createSessionLocked(userID string) (string, error) {
+func (s *Service) createSessionLocked(user User) (string, error) {
 	token, err := randomToken(sessionIDBytes)
 	if err != nil {
 		return "", err
 	}
 
 	s.sessions[token] = session{
-		UserID:    userID,
+		User:      user,
 		ExpiresAt: time.Now().Add(s.sessionTTL),
 	}
 
