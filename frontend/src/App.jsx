@@ -1703,73 +1703,71 @@ function TorrentsPage() {
                 const previewFiles = selectTorrentPreviewFiles(torrent.files)
 
                 return (
-                  <TiltCard key={torrent.id} className="tilt-card-torrent" intensity={7}>
-                    <article className={cx('torrent-card', downloading && 'is-active', recent && 'is-recent')}>
-                      <div className="torrent-head">
-                        <div className="text-break">
-                          <h4>{displayName(torrent.name)}</h4>
-                          <p>{labelFromStatus(torrent.status)}</p>
-                        </div>
-                        <div className="torrent-badges">
-                          {recent && <Badge tone="success">New</Badge>}
-                          {downloading && <Badge tone="accent">Downloading</Badge>}
-                          <Badge tone={torrent.isFinished ? 'success' : 'neutral'}>{formatPercent(torrent.progress)}</Badge>
-                        </div>
+                  <article key={torrent.id} className={cx('torrent-card', downloading && 'is-active', recent && 'is-recent')}>
+                    <div className="torrent-head">
+                      <div className="text-break">
+                        <h4>{displayName(torrent.name)}</h4>
+                        <p>{labelFromStatus(torrent.status)}</p>
                       </div>
-
-                      <ProgressBar value={torrent.progress} />
-
-                      <div className="torrent-kpis">
-                        <div className="torrent-kpi">
-                          <span>Downloaded</span>
-                          <strong>{formatBytes(torrent.downloadedEver)} / {formatBytes(torrent.sizeWhenDone)}</strong>
-                        </div>
-                        <div className="torrent-kpi">
-                          <span>Speed</span>
-                          <strong>{formatBytes(torrent.rateDownload)}/s</strong>
-                        </div>
-                        <div className="torrent-kpi">
-                          <span>ETA</span>
-                          <strong>{formatEta(torrent.eta)}</strong>
-                        </div>
+                      <div className="torrent-badges">
+                        {recent && <Badge tone="success">New</Badge>}
+                        {downloading && <Badge tone="accent">Downloading</Badge>}
+                        <Badge tone={torrent.isFinished ? 'success' : 'neutral'}>{formatPercent(torrent.progress)}</Badge>
                       </div>
+                    </div>
 
-                      {previewFiles.length > 0 ? (
-                        <div className="torrent-preview-list">
-                          {previewFiles.map((file) => {
-                            const canPlay = file.streamable || (isPlayableVideo(file.path || file.name) && file.bytesCompleted > 0)
-                            return (
-                              <div key={`${torrent.id}-${file.index}`} className="torrent-preview-item">
-                                <div className="torrent-preview-main text-break">
-                                  <strong>{fileTitle(file.path || file.name)}</strong>
-                                  <span>{formatPercent(file.progress)} · {formatBytes(file.bytesCompleted)} / {formatBytes(file.size)}</span>
-                                </div>
-                                <Button
-                                  type="button"
-                                  size="sm"
-                                  onClick={() => handlePlay(torrent, file)}
-                                  disabled={!canPlay}
-                                >
-                                  {file.progress < 100 ? 'Watch now' : 'Play'}
-                                </Button>
+                    <ProgressBar value={torrent.progress} />
+
+                    <div className="torrent-kpis">
+                      <div className="torrent-kpi">
+                        <span>Downloaded</span>
+                        <strong>{formatBytes(torrent.downloadedEver)} / {formatBytes(torrent.sizeWhenDone)}</strong>
+                      </div>
+                      <div className="torrent-kpi">
+                        <span>Speed</span>
+                        <strong>{formatBytes(torrent.rateDownload)}/s</strong>
+                      </div>
+                      <div className="torrent-kpi">
+                        <span>ETA</span>
+                        <strong>{formatEta(torrent.eta)}</strong>
+                      </div>
+                    </div>
+
+                    {previewFiles.length > 0 ? (
+                      <div className="torrent-preview-list">
+                        {previewFiles.map((file) => {
+                          const canPlay = file.streamable || (isPlayableVideo(file.path || file.name) && file.bytesCompleted > 0)
+                          return (
+                            <div key={`${torrent.id}-${file.index}`} className="torrent-preview-item">
+                              <div className="torrent-preview-main text-break">
+                                <strong>{fileTitle(file.path || file.name)}</strong>
+                                <span>{formatPercent(file.progress)} · {formatBytes(file.bytesCompleted)} / {formatBytes(file.size)}</span>
                               </div>
-                            )
-                          })}
-                        </div>
-                      ) : (
-                        <p className="helper-note">Waiting for media files...</p>
-                      )}
+                              <Button
+                                type="button"
+                                size="sm"
+                                onClick={() => handlePlay(torrent, file)}
+                                disabled={!canPlay}
+                              >
+                                {file.progress < 100 ? 'Watch now' : 'Play'}
+                              </Button>
+                            </div>
+                          )
+                        })}
+                      </div>
+                    ) : (
+                      <p className="helper-note">Waiting for media files...</p>
+                    )}
 
-                      {torrent.files.length > 0 && (
-                        <details className="torrent-details">
-                          <summary>All files ({torrent.files.length})</summary>
-                          <div className="torrent-details-body">
-                            <TorrentTree files={torrent.files} onPlay={(file) => handlePlay(torrent, file)} />
-                          </div>
-                        </details>
-                      )}
-                    </article>
-                  </TiltCard>
+                    {torrent.files.length > 0 && (
+                      <details className="torrent-details">
+                        <summary>All files ({torrent.files.length})</summary>
+                        <div className="torrent-details-body">
+                          <TorrentTree files={torrent.files} onPlay={(file) => handlePlay(torrent, file)} />
+                        </div>
+                      </details>
+                    )}
+                  </article>
                 )
               })}
             </div>
@@ -2831,65 +2829,29 @@ function SettingsPage() {
   )
 }
 
-function TiltCard({ children, className, intensity = 8 }) {
-  const handleMove = useCallback((event) => {
-    const element = event.currentTarget
-    const rect = element.getBoundingClientRect()
-    if (!rect.width || !rect.height) return
-
-    const px = (event.clientX - rect.left) / rect.width
-    const py = (event.clientY - rect.top) / rect.height
-    const rotateX = (0.5 - py) * intensity
-    const rotateY = (px - 0.5) * intensity
-
-    element.style.setProperty('--tilt-x', `${rotateY.toFixed(2)}deg`)
-    element.style.setProperty('--tilt-y', `${rotateX.toFixed(2)}deg`)
-    element.style.setProperty('--tilt-glow-x', `${(px * 100).toFixed(1)}%`)
-    element.style.setProperty('--tilt-glow-y', `${(py * 100).toFixed(1)}%`)
-  }, [intensity])
-
-  const resetTilt = useCallback((event) => {
-    const element = event.currentTarget
-    element.style.setProperty('--tilt-x', '0deg')
-    element.style.setProperty('--tilt-y', '0deg')
-    element.style.setProperty('--tilt-glow-x', '50%')
-    element.style.setProperty('--tilt-glow-y', '50%')
-  }, [])
-
-  return (
-    <div className={cx('tilt-card', className)} onMouseMove={handleMove} onMouseLeave={resetTilt}>
-      {children}
-    </div>
-  )
-}
-
 function SectionCard({ title, subtitle, actions, className, children }) {
   return (
-    <TiltCard className="tilt-card-shell">
-      <section className={cx('card', className)}>
-        {(title || subtitle || actions) && (
-          <div className="card-head">
-            <div className="text-break">
-              {title && <h3>{title}</h3>}
-              {subtitle && <p>{subtitle}</p>}
-            </div>
-            {actions ? <div className="card-actions">{actions}</div> : null}
+    <section className={cx('card', className)}>
+      {(title || subtitle || actions) && (
+        <div className="card-head">
+          <div className="text-break">
+            {title && <h3>{title}</h3>}
+            {subtitle && <p>{subtitle}</p>}
           </div>
-        )}
-        {children}
-      </section>
-    </TiltCard>
+          {actions ? <div className="card-actions">{actions}</div> : null}
+        </div>
+      )}
+      {children}
+    </section>
   )
 }
 
 function StatTile({ label, value }) {
   return (
-    <TiltCard className="tilt-card-tile" intensity={10}>
-      <div className="stat-tile">
-        <span>{label}</span>
-        <strong>{value}</strong>
-      </div>
-    </TiltCard>
+    <div className="stat-tile">
+      <span>{label}</span>
+      <strong>{value}</strong>
+    </div>
   )
 }
 
