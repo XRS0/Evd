@@ -34,6 +34,12 @@ const ROUTE_META = [
     title: 'Player'
   },
   {
+    id: 'watch-together',
+    label: 'Together',
+    to: '/watch-together',
+    title: 'Watch Together'
+  },
+  {
     id: 'settings',
     label: 'Settings',
     to: '/settings',
@@ -154,6 +160,16 @@ const isVideoFullscreen = (video) => {
   return Boolean(video.webkitDisplayingFullscreen)
 }
 
+const isVideoSeekable = (video) => {
+  if (!video) return false
+  if (!Number.isFinite(video.duration) || video.duration <= 0) return false
+  try {
+    return Boolean(video.seekable && video.seekable.length > 0)
+  } catch (err) {
+    return false
+  }
+}
+
 const encodePath = (value = '') => {
   try {
     const encoded = btoa(encodeURIComponent(value))
@@ -269,7 +285,8 @@ function resolveRouteMeta(pathname) {
   if (pathname.startsWith('/library')) return ROUTE_META[1]
   if (pathname.startsWith('/torrents')) return ROUTE_META[2]
   if (pathname.startsWith('/player')) return ROUTE_META[3]
-  if (pathname.startsWith('/settings')) return ROUTE_META[4]
+  if (pathname.startsWith('/watch-together')) return ROUTE_META[4]
+  if (pathname.startsWith('/settings')) return ROUTE_META[5]
   return ROUTE_META[0]
 }
 
@@ -286,8 +303,43 @@ function resolveInitialTheme() {
   return 'dark'
 }
 
+const readJsonSafe = async (res) => {
+  try {
+    return await res.json()
+  } catch (err) {
+    return null
+  }
+}
+
+const readErrorMessage = async (res) => {
+  try {
+    const body = await res.text()
+    return body?.trim() || 'Request failed'
+  } catch (err) {
+    return 'Request failed'
+  }
+}
+
+const extractHubID = (value = '') => {
+  const raw = value.trim()
+  if (!raw) return ''
+
+  if (raw.startsWith('http://') || raw.startsWith('https://')) {
+    try {
+      const parsed = new URL(raw)
+      return parsed.searchParams.get('hub')?.trim() || ''
+    } catch (err) {
+      return ''
+    }
+  }
+
+  return raw
+}
+
 function App() {
   const [theme, setTheme] = useState(resolveInitialTheme)
+  const [authUser, setAuthUser] = useState(null)
+  const [authLoading, setAuthLoading] = useState(true)
   const [deviceId] = useState(getOrCreateDeviceId)
   const [watchHistory, setWatchHistory] = useState(() => loadHistoryForDevice(deviceId))
   const [videos, setVideos] = useState([])
@@ -329,6 +381,19 @@ function App() {
     setToast(null)
   }, [])
 
+  const authedFetch = useCallback(async (input, init = {}) => {
+    const response = await fetch(input, {
+      credentials: 'include',
+      ...init
+    })
+
+    if (response.status === 401) {
+      setAuthUser(null)
+    }
+
+    return response
+  }, [])
+
   useEffect(() => {
     document.documentElement.setAttribute('data-theme', theme)
     try {
@@ -340,6 +405,37 @@ function App() {
 
   const toggleTheme = useCallback(() => {
     setTheme((value) => (value === 'dark' ? 'light' : 'dark'))
+  }, [])
+
+  useEffect(() => {
+    let cancelled = false
+
+    const bootstrapAuth = async () => {
+      try {
+        const res = await fetch('/api/auth/me', { credentials: 'include' })
+        if (cancelled) return
+
+        if (!res.ok) {
+          setAuthUser(null)
+          return
+        }
+
+        const data = await readJsonSafe(res)
+        if (!cancelled) {
+          setAuthUser(data?.user || null)
+        }
+      } catch (err) {
+        if (!cancelled) setAuthUser(null)
+      } finally {
+        if (!cancelled) setAuthLoading(false)
+      }
+    }
+
+    void bootstrapAuth()
+
+    return () => {
+      cancelled = true
+    }
   }, [])
 
   const watchHistoryByPath = useMemo(() => {
@@ -370,42 +466,50 @@ function App() {
   }, [toast])
 
   const fetchVideos = useCallback(async ({ silent = false } = {}) => {
+    if (!authUser) return
     if (!silent) setLibraryLoading(true)
     try {
-      const res = await fetch('/api/videos')
-      const data = await res.json()
+      const res = await authedFetch('/api/videos')
+      if (!res.ok) throw new Error(`videos_${res.status}`)
+      const data = await readJsonSafe(res)
       setVideos(Array.isArray(data) ? data : [])
     } catch (err) {
+      if (String(err?.message || '').startsWith('videos_401')) return
       if (!silent) pushToast('Unable to load video library.', 'error')
       setVideos([])
     } finally {
       if (!silent) setLibraryLoading(false)
     }
-  }, [pushToast])
+  }, [authUser, authedFetch, pushToast])
 
   const fetchTorrents = useCallback(async ({ silent = false } = {}) => {
+    if (!authUser) return
     if (!silent) setTorrentLoading(true)
     try {
-      const res = await fetch('/api/torrents')
-      const data = await res.json()
+      const res = await authedFetch('/api/torrents')
+      if (!res.ok) throw new Error(`torrents_${res.status}`)
+      const data = await readJsonSafe(res)
       setTorrentEnabled(Boolean(data?.enabled ?? data?.Enabled))
       setTorrentError(data?.error ?? data?.Error ?? '')
       const items = Array.isArray(data?.items ?? data?.Items) ? (data.items ?? data.Items) : []
       setTorrents(items.map(normalizeTorrent))
     } catch (err) {
+      if (String(err?.message || '').startsWith('torrents_401')) return
       setTorrentError('Transmission unavailable')
       setTorrents([])
       if (!silent) pushToast('Unable to reach Transmission backend.', 'error')
     } finally {
       if (!silent) setTorrentLoading(false)
     }
-  }, [pushToast])
+  }, [authUser, authedFetch, pushToast])
 
   useEffect(() => {
+    if (!authUser) return
     void Promise.all([fetchVideos(), fetchTorrents()])
-  }, [fetchVideos, fetchTorrents])
+  }, [authUser, fetchVideos, fetchTorrents])
 
   useEffect(() => {
+    if (!authUser) return undefined
     let cancelled = false
 
     const tick = async () => {
@@ -422,7 +526,7 @@ function App() {
       cancelled = true
       if (torrentPollRef.current) clearTimeout(torrentPollRef.current)
     }
-  }, [fetchTorrents, fetchVideos])
+  }, [authUser, fetchTorrents, fetchVideos])
 
   const stopVodPolling = useCallback(() => {
     if (vodPollRef.current) {
@@ -431,12 +535,45 @@ function App() {
     }
   }, [])
 
+  const logout = useCallback(async () => {
+    try {
+      await fetch('/api/auth/logout', { method: 'POST', credentials: 'include' })
+    } catch (err) {
+      // ignore network error on logout
+    }
+    setAuthUser(null)
+  }, [])
+
+  useEffect(() => {
+    if (authUser) return
+
+    stopVodPolling()
+    if (torrentPollRef.current) {
+      clearTimeout(torrentPollRef.current)
+      torrentPollRef.current = null
+    }
+
+    activePathRef.current = null
+    setVideos([])
+    setTorrents([])
+    setActiveVideo(null)
+    setPlaybackUrl('')
+    setPlaybackKind('idle')
+    setPlayerState('idle')
+    setPlayerError('')
+    setVodState({ status: 'idle', url: '', progress: 0 })
+    setLoading(false)
+    setLibraryLoading(true)
+    setTorrentLoading(true)
+  }, [authUser, stopVodPolling])
+
   const pollVodStatus = useCallback(async (path) => {
     if (activePathRef.current !== path) return
 
     try {
-      const res = await fetch(buildVodStatusUrl(path))
-      const data = await res.json()
+      const res = await authedFetch(buildVodStatusUrl(path))
+      if (!res.ok) throw new Error(`vod_status_${res.status}`)
+      const data = await readJsonSafe(res)
 
       if (data.ready && data.url) {
         setVodState({ status: 'ready', url: data.url, progress: 100 })
@@ -458,22 +595,23 @@ function App() {
 
       setVodState({ status: 'preparing', url: '', progress: data.progress ?? 0 })
     } catch (err) {
+      if (String(err?.message || '').startsWith('vod_status_401')) return
       setVodState({ status: 'preparing', url: '', progress: 0 })
     }
 
     vodPollRef.current = setTimeout(() => {
       void pollVodStatus(path)
     }, 1200)
-  }, [pushToast, stopVodPolling])
+  }, [authedFetch, pushToast, stopVodPolling])
 
   const startVod = useCallback(async (path) => {
     stopVodPolling()
     setVodState({ status: 'preparing', url: '', progress: 0 })
 
     try {
-      const res = await fetch(buildVodStartUrl(path), { method: 'POST' })
+      const res = await authedFetch(buildVodStartUrl(path), { method: 'POST' })
       if (res.ok) {
-        const data = await res.json()
+        const data = await readJsonSafe(res)
         if (activePathRef.current !== path) return
         if (data.status === 'ready' && data.url) {
           setVodState({ status: 'ready', url: data.url, progress: 100 })
@@ -491,7 +629,7 @@ function App() {
     vodPollRef.current = setTimeout(() => {
       void pollVodStatus(path)
     }, 1200)
-  }, [pollVodStatus, stopVodPolling])
+  }, [authedFetch, pollVodStatus, stopVodPolling])
 
   const findTorrentFile = useCallback((path) => {
     if (!path) return null
@@ -565,10 +703,10 @@ function App() {
         formData.append('chunkIndex', String(chunkIndex))
         formData.append('totalChunks', String(totalChunks))
 
-        const res = await fetch('/api/upload', { method: 'POST', body: formData })
+        const res = await authedFetch('/api/upload', { method: 'POST', body: formData })
         if (!res.ok) throw new Error('Upload failed')
 
-        await res.json()
+        await readJsonSafe(res)
         setUploadProgress(Math.round(((chunkIndex + 1) / totalChunks) * 100))
       }
 
@@ -582,7 +720,7 @@ function App() {
       setUploading(false)
       setUploadProgress(0)
     }
-  }, [fetchVideos, pushToast])
+  }, [authedFetch, fetchVideos, pushToast])
 
   const uploadTorrent = useCallback(async (file) => {
     if (!file || !file.name.toLowerCase().endsWith('.torrent')) {
@@ -598,14 +736,14 @@ function App() {
       const formData = new FormData()
       formData.append('torrent', file)
 
-      const res = await fetch('/api/torrent/upload', {
+      const res = await authedFetch('/api/torrent/upload', {
         method: 'POST',
         body: formData
       })
 
       if (!res.ok) throw new Error('Upload failed')
 
-      await res.json()
+      await readJsonSafe(res)
       setTorrentMessage('Torrent added. Download started.')
       pushToast('Torrent added successfully.', 'success')
       await fetchTorrents({ silent: true })
@@ -615,16 +753,16 @@ function App() {
     } finally {
       setTorrentUploading(false)
     }
-  }, [fetchTorrents, pushToast])
+  }, [authedFetch, fetchTorrents, pushToast])
 
   const enableTorrentStreaming = useCallback(async (torrentId) => {
     if (!torrentId) return
     try {
-      await fetch(`/api/torrent/stream/${torrentId}`, { method: 'POST' })
+      await authedFetch(`/api/torrent/stream/${torrentId}`, { method: 'POST' })
     } catch (err) {
       pushToast('Failed to switch torrent into stream mode.', 'error')
     }
-  }, [pushToast])
+  }, [authedFetch, pushToast])
 
   const handleVideoSelect = useCallback((event) => {
     const file = event.target.files?.[0]
@@ -648,6 +786,7 @@ function App() {
 
   const contextValue = useMemo(
     () => ({
+      authUser,
       videos,
       videoTree,
       torrents,
@@ -682,12 +821,16 @@ function App() {
       handleVideoSelect,
       handleTorrentSelect,
       setPlaybackUrl,
+      authedFetch,
+      pushToast,
       toast,
       dismissToast,
       theme,
-      toggleTheme
+      toggleTheme,
+      logout
     }),
     [
+      authUser,
       videos,
       videoTree,
       torrents,
@@ -717,12 +860,29 @@ function App() {
       enableTorrentStreaming,
       handleVideoSelect,
       handleTorrentSelect,
+      authedFetch,
+      pushToast,
       toast,
       dismissToast,
       theme,
-      toggleTheme
+      toggleTheme,
+      logout
     ]
   )
+
+  if (authLoading) {
+    return (
+      <AuthShell theme={theme} toggleTheme={toggleTheme}>
+        <SectionCard title="Authentication">
+          <EmptyState title="Checking session" description="Please wait..." compact />
+        </SectionCard>
+      </AuthShell>
+    )
+  }
+
+  if (!authUser) {
+    return <AuthPage theme={theme} toggleTheme={toggleTheme} onAuthenticated={setAuthUser} />
+  }
 
   return (
     <Routes>
@@ -734,14 +894,203 @@ function App() {
         </Route>
         <Route path="torrents" element={<TorrentsPage />} />
         <Route path="player" element={<PlayerPage />} />
+        <Route path="watch-together" element={<WatchTogetherPage />} />
         <Route path="settings" element={<SettingsPage />} />
       </Route>
     </Routes>
   )
 }
 
+function AuthShell({ theme, toggleTheme, children }) {
+  return (
+    <div className="auth-shell">
+      <div className="auth-surface">
+        <div className="auth-head">
+          <div className="brand-block">
+            <div className="brand-logo">
+              <img src={brandImage} alt="EVD logo" />
+            </div>
+            <div className="brand-copy">
+              <strong>Edge Video Deck</strong>
+            </div>
+          </div>
+          <Button type="button" variant="ghost" size="sm" onClick={toggleTheme}>
+            {theme === 'dark' ? 'Light theme' : 'Dark theme'}
+          </Button>
+        </div>
+        {children}
+      </div>
+    </div>
+  )
+}
+
+function AuthPage({ theme, toggleTheme, onAuthenticated }) {
+  const [mode, setMode] = useState('login')
+  const [username, setUsername] = useState('')
+  const [password, setPassword] = useState('')
+  const [passwordConfirm, setPasswordConfirm] = useState('')
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState('')
+
+  const handleGuestLogin = useCallback(async () => {
+    if (loading) return
+
+    setLoading(true)
+    setError('')
+
+    try {
+      const res = await fetch('/api/auth/guest', {
+        method: 'POST',
+        credentials: 'include'
+      })
+
+      if (!res.ok) {
+        setError(await readErrorMessage(res))
+        return
+      }
+
+      const data = await readJsonSafe(res)
+      if (!data?.user) {
+        setError('Invalid server response.')
+        return
+      }
+
+      onAuthenticated(data.user)
+      setUsername('')
+      setPassword('')
+      setPasswordConfirm('')
+    } catch (err) {
+      setError('Authentication failed. Please try again.')
+    } finally {
+      setLoading(false)
+    }
+  }, [loading, onAuthenticated])
+
+  const handleSubmit = useCallback(async (event) => {
+    event.preventDefault()
+    if (loading) return
+
+    const cleanUsername = username.trim()
+    const cleanPassword = password.trim()
+
+    if (!cleanUsername || !cleanPassword) {
+      setError('Username and password are required.')
+      return
+    }
+    if (mode === 'register' && cleanPassword !== passwordConfirm.trim()) {
+      setError('Passwords do not match.')
+      return
+    }
+
+    setLoading(true)
+    setError('')
+
+    try {
+      const endpoint = mode === 'register' ? '/api/auth/register' : '/api/auth/login'
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        credentials: 'include',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          username: cleanUsername,
+          password: cleanPassword
+        })
+      })
+
+      if (!res.ok) {
+        setError(await readErrorMessage(res))
+        return
+      }
+
+      const data = await readJsonSafe(res)
+      if (!data?.user) {
+        setError('Invalid server response.')
+        return
+      }
+      onAuthenticated(data.user)
+      setPassword('')
+      setPasswordConfirm('')
+    } catch (err) {
+      setError('Authentication failed. Please try again.')
+    } finally {
+      setLoading(false)
+    }
+  }, [loading, mode, onAuthenticated, password, passwordConfirm, username])
+
+  return (
+    <AuthShell theme={theme} toggleTheme={toggleTheme}>
+      <SectionCard title={mode === 'register' ? 'Create account' : 'Sign in'} subtitle="Library is shared. Use an account or continue as guest.">
+        <form className="auth-form" onSubmit={handleSubmit}>
+          <label className="auth-field">
+            <span>Username</span>
+            <input
+              type="text"
+              value={username}
+              onChange={(event) => setUsername(event.target.value)}
+              autoComplete="username"
+              placeholder="user_01"
+              minLength={3}
+              maxLength={32}
+              required
+            />
+          </label>
+          <label className="auth-field">
+            <span>Password</span>
+            <input
+              type="password"
+              value={password}
+              onChange={(event) => setPassword(event.target.value)}
+              autoComplete={mode === 'register' ? 'new-password' : 'current-password'}
+              minLength={6}
+              maxLength={128}
+              required
+            />
+          </label>
+          {mode === 'register' && (
+            <label className="auth-field">
+              <span>Repeat password</span>
+              <input
+                type="password"
+                value={passwordConfirm}
+                onChange={(event) => setPasswordConfirm(event.target.value)}
+                autoComplete="new-password"
+                minLength={6}
+                maxLength={128}
+                required
+              />
+            </label>
+          )}
+
+          {error && <p className="helper-note auth-error">{error}</p>}
+
+          <div className="auth-actions">
+            <Button type="submit" variant="primary" disabled={loading}>
+              {loading ? 'Please wait' : mode === 'register' ? 'Create account' : 'Login'}
+            </Button>
+            <Button type="button" variant="secondary" onClick={() => void handleGuestLogin()} disabled={loading}>
+              Continue as guest
+            </Button>
+            <Button
+              type="button"
+              variant="ghost"
+              onClick={() => {
+                setMode((value) => (value === 'register' ? 'login' : 'register'))
+                setError('')
+              }}
+            >
+              {mode === 'register' ? 'Have account? Login' : 'No account? Register'}
+            </Button>
+          </div>
+        </form>
+      </SectionCard>
+    </AuthShell>
+  )
+}
+
 function Layout({ contextValue }) {
-  const { activeVideo, torrentEnabled, torrentError, toast, dismissToast, theme, toggleTheme } = contextValue
+  const { activeVideo, torrentEnabled, torrentError, toast, dismissToast, theme, toggleTheme, authUser, logout } = contextValue
   const location = useLocation()
   const routeMeta = resolveRouteMeta(location.pathname)
 
@@ -775,6 +1124,9 @@ function Layout({ contextValue }) {
             {torrentEnabled && !torrentError ? 'Transmission online' : 'Transmission offline'}
           </Badge>
           <div className="sidebar-now">
+            <strong className="text-break">User: {authUser?.username || 'Unknown'}</strong>
+          </div>
+          <div className="sidebar-now">
             <strong className="text-break">{activeVideo ? displayName(activeVideo.path) : 'No active stream'}</strong>
           </div>
         </div>
@@ -786,6 +1138,10 @@ function Layout({ contextValue }) {
             <h1>{routeMeta.title}</h1>
           </div>
           <div className="header-meta">
+            <Badge tone="neutral">{authUser?.username}</Badge>
+            <Button type="button" variant="ghost" size="sm" onClick={logout}>
+              Logout
+            </Button>
             <Button type="button" variant="ghost" size="sm" onClick={toggleTheme}>
               {theme === 'dark' ? 'Light theme' : 'Dark theme'}
             </Button>
@@ -1653,6 +2009,551 @@ function PlayerPage() {
           )}
 
           {playerError && <div className="status-item danger">{playerError}</div>}
+        </div>
+      </SectionCard>
+    </div>
+  )
+}
+
+function WatchTogetherPage() {
+  const {
+    authUser,
+    videos,
+    activeVideo,
+    playbackUrl,
+    playerState,
+    loading,
+    playVideo,
+    authedFetch,
+    pushToast
+  } = useOutletContext()
+  const location = useLocation()
+  const navigate = useNavigate()
+
+  const [selectedPath, setSelectedPath] = useState('')
+  const [hubInput, setHubInput] = useState('')
+  const [hubState, setHubState] = useState(null)
+  const [hubBusy, setHubBusy] = useState(false)
+  const [hubError, setHubError] = useState('')
+  const [connectionState, setConnectionState] = useState('Disconnected')
+  const [chatInput, setChatInput] = useState('')
+  const [chatSending, setChatSending] = useState(false)
+
+  const videoRef = useRef(null)
+  const eventSourceRef = useRef(null)
+  const suppressOutgoingRef = useRef(false)
+  const suppressTimerRef = useRef(null)
+  const lastSeekBroadcastRef = useRef(0)
+
+  const videoMap = useMemo(
+    () => new Map(videos.map((video) => [normalizePath(video.path), video])),
+    [videos]
+  )
+
+  const inviteLink = useMemo(() => {
+    if (!hubState?.id) return ''
+    return `${window.location.origin}/watch-together?hub=${encodeURIComponent(hubState.id)}`
+  }, [hubState?.id])
+
+  useEffect(() => {
+    if (activeVideo?.path) {
+      setSelectedPath((value) => value || activeVideo.path)
+    }
+  }, [activeVideo?.path])
+
+  const closeHubStream = useCallback(() => {
+    if (eventSourceRef.current) {
+      eventSourceRef.current.close()
+      eventSourceRef.current = null
+    }
+    setConnectionState('Disconnected')
+  }, [])
+
+  useEffect(() => {
+    return () => {
+      closeHubStream()
+      if (suppressTimerRef.current) {
+        clearTimeout(suppressTimerRef.current)
+        suppressTimerRef.current = null
+      }
+    }
+  }, [closeHubStream])
+
+  const markSuppressOutgoing = useCallback((ms = 1300) => {
+    suppressOutgoingRef.current = true
+    if (suppressTimerRef.current) {
+      clearTimeout(suppressTimerRef.current)
+    }
+    suppressTimerRef.current = setTimeout(() => {
+      suppressOutgoingRef.current = false
+      suppressTimerRef.current = null
+    }, ms)
+  }, [])
+
+  const waitForVideoElement = useCallback(async (timeoutMs = 5000) => {
+    const startedAt = Date.now()
+    while (Date.now() - startedAt < timeoutMs) {
+      if (videoRef.current) return videoRef.current
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    }
+    return null
+  }, [])
+
+  const ensureVideoMetadata = useCallback(async (video, timeoutMs = 5000) => {
+    if (!video) return false
+    if (video.readyState >= 1) return true
+
+    return await new Promise((resolve) => {
+      let settled = false
+      const finalize = (result) => {
+        if (settled) return
+        settled = true
+        video.removeEventListener('loadedmetadata', onLoadedMetadata)
+        video.removeEventListener('error', onError)
+        clearTimeout(timeoutID)
+        resolve(result)
+      }
+      const onLoadedMetadata = () => finalize(true)
+      const onError = () => finalize(false)
+      const timeoutID = setTimeout(() => finalize(false), timeoutMs)
+
+      video.addEventListener('loadedmetadata', onLoadedMetadata, { once: true })
+      video.addEventListener('error', onError, { once: true })
+    })
+  }, [])
+
+  const applyHubEventToPlayer = useCallback(async (eventPayload) => {
+    const state = eventPayload?.hub
+    if (!state?.videoPath) return
+
+    const action = String(eventPayload?.action || eventPayload?.type || 'sync').toLowerCase()
+    const normalizedPath = normalizePath(state.videoPath)
+    if (normalizePath(activeVideo?.path || '') !== normalizedPath) {
+      const target = videoMap.get(normalizedPath)
+      if (!target) {
+        pushToast(`Video "${state.videoPath}" is missing in local library.`, 'error')
+        return
+      }
+      await playVideo(target)
+    }
+
+    const video = await waitForVideoElement()
+    if (!video) return
+
+    markSuppressOutgoing(action === 'seek' ? 900 : 1600)
+
+    const metadataReady = await ensureVideoMetadata(video)
+    const desiredTime = Number.isFinite(state.currentTime) && state.currentTime >= 0 ? state.currentTime : 0
+
+    if (metadataReady && isVideoSeekable(video) && Math.abs((video.currentTime || 0) - desiredTime) > 0.7) {
+      try {
+        video.currentTime = desiredTime
+      } catch (err) {
+        // ignore seek race when stream just switched
+      }
+    } else if (!metadataReady && desiredTime > 0) {
+      video.addEventListener('loadedmetadata', () => {
+        try {
+          video.currentTime = desiredTime
+        } catch (err) {
+          // ignore delayed seek race
+        }
+      }, { once: true })
+    }
+
+    if (action === 'seek') {
+      return
+    }
+
+    if (action === 'play') {
+      await video.play().catch(() => {})
+      return
+    }
+
+    if (action === 'pause') {
+      video.pause()
+      return
+    }
+
+    if (action === 'video' || action === 'sync') {
+      if (state.playing) {
+        await video.play().catch(() => {})
+      } else {
+        video.pause()
+      }
+    }
+  }, [activeVideo?.path, ensureVideoMetadata, markSuppressOutgoing, playVideo, pushToast, videoMap, waitForVideoElement])
+
+  const sendControl = useCallback(async (action, overrides = {}) => {
+    if (!hubState?.id) return
+
+    const video = videoRef.current
+    const payload = {
+      action,
+      currentTime: Number.isFinite(overrides.currentTime) ? overrides.currentTime : (video?.currentTime || 0),
+      playing: typeof overrides.playing === 'boolean' ? overrides.playing : !(video?.paused ?? true)
+    }
+
+    if (overrides.videoPath) {
+      payload.videoPath = overrides.videoPath
+    }
+
+    if (action === 'seek' && !Number.isFinite(payload.currentTime)) return
+
+    const res = await authedFetch(`/api/watch-hubs/${encodeURIComponent(hubState.id)}/control`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(payload)
+    })
+    if (!res.ok) {
+      pushToast('Failed to sync playback action.', 'error')
+    }
+  }, [authedFetch, hubState?.id, pushToast])
+
+  const sendChat = useCallback(async () => {
+    if (!hubState?.id) return
+    const text = chatInput.trim()
+    if (!text || chatSending) return
+
+    setChatSending(true)
+    try {
+      const res = await authedFetch(`/api/watch-hubs/${encodeURIComponent(hubState.id)}/chat`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ text })
+      })
+      if (!res.ok) {
+        pushToast(await readErrorMessage(res), 'error')
+        return
+      }
+      setChatInput('')
+    } catch (err) {
+      pushToast('Failed to send chat message.', 'error')
+    } finally {
+      setChatSending(false)
+    }
+  }, [authedFetch, chatInput, chatSending, hubState?.id, pushToast])
+
+  const connectHubStream = useCallback((hubID) => {
+    closeHubStream()
+
+    const stream = new EventSource(`/api/watch-hubs/${encodeURIComponent(hubID)}/events`)
+    eventSourceRef.current = stream
+    setConnectionState('Connecting...')
+
+    stream.onopen = () => {
+      setConnectionState('Connected')
+    }
+
+    stream.onmessage = (message) => {
+      try {
+        const payload = JSON.parse(message.data)
+        const nextHub = payload?.hub
+        if (!nextHub) return
+        setHubState(nextHub)
+
+        if (payload.type === 'chat') return
+        if (payload.type === 'presence') return
+        if (payload.type === 'control' && payload.actorId === authUser?.id) return
+        void applyHubEventToPlayer(payload)
+      } catch (err) {
+        // ignore malformed message
+      }
+    }
+
+    stream.onerror = () => {
+      setConnectionState('Reconnecting...')
+    }
+  }, [applyHubEventToPlayer, authUser?.id, closeHubStream])
+
+  const joinHub = useCallback(async (hubID, options = {}) => {
+    const normalizedHubID = extractHubID(hubID)
+    if (!normalizedHubID) return
+
+    setHubBusy(true)
+    setHubError('')
+
+    try {
+      const res = await authedFetch(`/api/watch-hubs/${encodeURIComponent(normalizedHubID)}`)
+      if (!res.ok) {
+        setHubError(await readErrorMessage(res))
+        return
+      }
+
+      const data = await readJsonSafe(res)
+      const nextHub = data?.hub
+      if (!nextHub?.id) {
+        setHubError('Hub response is invalid.')
+        return
+      }
+
+      setHubState(nextHub)
+      setHubInput(nextHub.id)
+      await applyHubEventToPlayer({ type: 'sync', action: 'sync', hub: nextHub })
+      connectHubStream(nextHub.id)
+
+      if (!options.keepURL) {
+        navigate(`/watch-together?hub=${encodeURIComponent(nextHub.id)}`, { replace: true })
+      }
+    } catch (err) {
+      setHubError('Failed to join hub.')
+    } finally {
+      setHubBusy(false)
+    }
+  }, [applyHubEventToPlayer, authedFetch, connectHubStream, navigate])
+
+  const createHub = useCallback(async () => {
+    const path = selectedPath || activeVideo?.path || ''
+    if (!path) {
+      setHubError('Choose a video before creating a hub.')
+      return
+    }
+
+    setHubBusy(true)
+    setHubError('')
+
+    try {
+      const target = videoMap.get(normalizePath(path))
+      if (target) {
+        await playVideo(target)
+      }
+
+      const video = videoRef.current
+      const res = await authedFetch('/api/watch-hubs', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          videoPath: path,
+          currentTime: video?.currentTime || 0,
+          playing: !(video?.paused ?? true)
+        })
+      })
+
+      if (!res.ok) {
+        setHubError(await readErrorMessage(res))
+        return
+      }
+
+      const data = await readJsonSafe(res)
+      const nextHub = data?.hub
+      if (!nextHub?.id) {
+        setHubError('Hub response is invalid.')
+        return
+      }
+
+      setHubState(nextHub)
+      setHubInput(nextHub.id)
+      connectHubStream(nextHub.id)
+      navigate(`/watch-together?hub=${encodeURIComponent(nextHub.id)}`, { replace: true })
+      pushToast('Watch hub created.', 'success')
+    } catch (err) {
+      setHubError('Failed to create hub.')
+    } finally {
+      setHubBusy(false)
+    }
+  }, [activeVideo?.path, authedFetch, connectHubStream, navigate, playVideo, pushToast, selectedPath, videoMap])
+
+  const leaveHub = useCallback(() => {
+    closeHubStream()
+    setHubState(null)
+    setHubError('')
+    setHubInput('')
+    setChatInput('')
+    navigate('/watch-together', { replace: true })
+  }, [closeHubStream, navigate])
+
+  useEffect(() => {
+    const queryHub = extractHubID(new URLSearchParams(location.search).get('hub') || '')
+    if (!queryHub) return
+    if (queryHub === hubState?.id) return
+    setHubInput(queryHub)
+    void joinHub(queryHub, { keepURL: true })
+  }, [hubState?.id, joinHub, location.search])
+
+  useEffect(() => {
+    const video = videoRef.current
+    if (!video || !hubState?.id) return undefined
+
+    const onPlay = () => {
+      if (suppressOutgoingRef.current) return
+      if (!Number.isFinite(video.duration) || video.duration <= 0) return
+      void sendControl('play', { currentTime: video.currentTime, playing: true })
+    }
+
+    const onPause = () => {
+      if (suppressOutgoingRef.current) return
+      if (!Number.isFinite(video.duration) || video.duration <= 0) return
+      void sendControl('pause', { currentTime: video.currentTime, playing: false })
+    }
+
+    const onSeeked = () => {
+      if (suppressOutgoingRef.current) return
+      if (!isVideoSeekable(video)) return
+      const now = Date.now()
+      if (now - lastSeekBroadcastRef.current < 140) return
+      lastSeekBroadcastRef.current = now
+      void sendControl('seek', { currentTime: video.currentTime })
+    }
+
+    video.addEventListener('play', onPlay)
+    video.addEventListener('pause', onPause)
+    video.addEventListener('seeked', onSeeked)
+
+    return () => {
+      video.removeEventListener('play', onPlay)
+      video.removeEventListener('pause', onPause)
+      video.removeEventListener('seeked', onSeeked)
+    }
+  }, [hubState?.id, sendControl, playbackUrl])
+
+  const hubMembers = hubState?.members || []
+  const hubMessages = hubState?.messages || []
+
+  return (
+    <div className="player-layout">
+      <SectionCard
+        className="player-card"
+        title="Watch Together"
+        subtitle="Create hub, share link, and synchronize playback controls."
+        actions={(
+          <div className="toolbar-actions">
+            <Badge tone={hubState?.id ? 'success' : 'neutral'}>{hubState?.id ? 'Hub active' : 'No hub'}</Badge>
+            {hubState?.id && (
+              <Button type="button" size="sm" variant="ghost" onClick={leaveHub}>
+                Leave hub
+              </Button>
+            )}
+          </div>
+        )}
+      >
+        <div className="stack-md">
+          <div className="watch-hub-grid">
+            <label className="auth-field">
+              <span>Hub ID or link code</span>
+              <input
+                type="text"
+                value={hubInput}
+                onChange={(event) => setHubInput(event.target.value)}
+                placeholder="Paste hub ID"
+              />
+            </label>
+            <Button type="button" onClick={() => void joinHub(hubInput)} disabled={hubBusy || !hubInput.trim()}>
+              Join hub
+            </Button>
+          </div>
+
+          <div className="watch-hub-grid">
+            <label className="auth-field">
+              <span>Video</span>
+              <select value={selectedPath} onChange={(event) => setSelectedPath(event.target.value)} disabled={loading || videos.length === 0}>
+                <option value="">Choose video</option>
+                {videos.map((video) => (
+                  <option key={video.path} value={video.path}>{fileTitle(video.path)}</option>
+                ))}
+              </select>
+            </label>
+            <Button type="button" variant="primary" onClick={() => void createHub()} disabled={hubBusy || (!selectedPath && !activeVideo?.path)}>
+              Create hub
+            </Button>
+            <Button
+              type="button"
+              onClick={() => {
+                if (!hubState?.id || !activeVideo?.path) return
+                void sendControl('video', { videoPath: activeVideo.path, currentTime: videoRef.current?.currentTime || 0 })
+              }}
+              disabled={!hubState?.id || !activeVideo?.path}
+            >
+              Sync current video
+            </Button>
+          </div>
+
+          {inviteLink && (
+            <div className="inline-item">
+              <div className="text-break">
+                <strong>Invite link</strong>
+                <p>{inviteLink}</p>
+              </div>
+              <Button
+                type="button"
+                size="sm"
+                onClick={async () => {
+                  try {
+                    await navigator.clipboard.writeText(inviteLink)
+                    pushToast('Invite link copied.', 'success')
+                  } catch (err) {
+                    pushToast('Failed to copy invite link.', 'error')
+                  }
+                }}
+              >
+                Copy
+              </Button>
+            </div>
+          )}
+
+          {hubError && <div className="status-item danger">{hubError}</div>}
+          {hubState?.id && (
+            <div className="status-list">
+              <div className="status-item">Hub ID: {hubState.id}</div>
+              <div className="status-item">Connection: {connectionState}</div>
+              <div className="status-item">Playback status: {playerState}</div>
+              <div className="status-item">Members: {hubMembers.map((member) => member.username).join(', ') || authUser?.username}</div>
+            </div>
+          )}
+        </div>
+
+        <div className="video-shell">
+          {activeVideo && playbackUrl ? (
+            <video ref={videoRef} controls playsInline preload="metadata" src={playbackUrl} />
+          ) : (
+            <EmptyState title="No active playback" description="Select a video and create or join a hub." compact />
+          )}
+        </div>
+
+        <div className="watch-chat-shell">
+          <div className="player-timeline-head">
+            <span>Hub chat</span>
+            <span>{hubMessages.length}</span>
+          </div>
+          <div className="watch-chat-list" role="log" aria-live="polite">
+            {hubMessages.length === 0 ? (
+              <EmptyState title="No messages yet" description="Write first message for participants." compact />
+            ) : (
+              hubMessages.map((message) => (
+                <div key={message.id} className={cx('watch-chat-item', message.userId === authUser?.id && 'self')}>
+                  <div className="watch-chat-meta">
+                    <strong>{message.username}</strong>
+                    <span>{new Date(message.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
+                  </div>
+                  <p className="watch-chat-text">{message.text}</p>
+                </div>
+              ))
+            )}
+          </div>
+          <form
+            className="watch-chat-form"
+            onSubmit={(event) => {
+              event.preventDefault()
+              void sendChat()
+            }}
+          >
+            <input
+              type="text"
+              value={chatInput}
+              onChange={(event) => setChatInput(event.target.value)}
+              placeholder={hubState?.id ? 'Type a message...' : 'Join hub to chat'}
+              maxLength={600}
+              disabled={!hubState?.id || chatSending}
+            />
+            <Button type="submit" size="sm" disabled={!hubState?.id || chatSending || !chatInput.trim()}>
+              Send
+            </Button>
+          </form>
         </div>
       </SectionCard>
     </div>

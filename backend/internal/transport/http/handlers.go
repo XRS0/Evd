@@ -4,14 +4,20 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"math"
 	"mime"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
+	authapp "evd/internal/application/auth"
+	watchpartyapp "evd/internal/application/watchparty"
 	mediadomain "evd/internal/domain/media"
 	torrentdomain "evd/internal/domain/torrent"
 	"github.com/gorilla/mux"
@@ -39,15 +45,173 @@ type mediaPathStore interface {
 	VideosRoot() string
 }
 
+type authUseCases interface {
+	Register(username, password string) (authapp.User, string, error)
+	Login(username, password string) (authapp.User, string, error)
+	LoginGuest() (authapp.User, string, error)
+	Authenticate(token string) (authapp.User, error)
+	Logout(token string)
+	SessionTTL() time.Duration
+}
+
+type watchPartyUseCases interface {
+	CreateHub(ownerID, ownerName, videoPath string, currentTime float64, playing bool) (watchpartyapp.Snapshot, error)
+	GetHub(hubID string) (watchpartyapp.Snapshot, error)
+	Subscribe(hubID, userID, username string) (<-chan watchpartyapp.Event, func(), error)
+	Control(hubID, userID, username string, input watchpartyapp.ControlInput) (watchpartyapp.Event, error)
+	Chat(hubID, userID, username, text string) (watchpartyapp.Event, error)
+}
+
 type Handler struct {
 	media    mediaUseCases
 	torrents torrentUseCases
 	store    mediaPathStore
+	auth     authUseCases
+	watch    watchPartyUseCases
 }
 
+const sessionCookieName = "evd_session"
+
+type contextKey string
+
+const userContextKey contextKey = "user"
+
 // NewHandler wires HTTP handlers with application use cases.
-func NewHandler(mediaService mediaUseCases, torrentService torrentUseCases, store mediaPathStore) *Handler {
-	return &Handler{media: mediaService, torrents: torrentService, store: store}
+func NewHandler(
+	mediaService mediaUseCases,
+	torrentService torrentUseCases,
+	store mediaPathStore,
+	authService authUseCases,
+	watchService watchPartyUseCases,
+) *Handler {
+	return &Handler{
+		media:    mediaService,
+		torrents: torrentService,
+		store:    store,
+		auth:     authService,
+		watch:    watchService,
+	}
+}
+
+// RequireAuth verifies the request session and injects user context.
+func (h *Handler) RequireAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodOptions {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		token := sessionTokenFromRequest(r)
+		if token == "" {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		user, err := h.auth.Authenticate(token)
+		if err != nil {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		ctx := context.WithValue(r.Context(), userContextKey, user)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+// Register handles account registration and starts a session.
+func (h *Handler) Register(w http.ResponseWriter, r *http.Request) {
+	var payload credentialsRequest
+	if err := decodeJSON(r, &payload); err != nil {
+		http.Error(w, "Invalid payload", http.StatusBadRequest)
+		return
+	}
+
+	user, sessionToken, err := h.auth.Register(payload.Username, payload.Password)
+	if err != nil {
+		switch {
+		case errors.Is(err, authapp.ErrUserExists):
+			http.Error(w, err.Error(), http.StatusConflict)
+		case errors.Is(err, authapp.ErrInvalidInput):
+			http.Error(w, err.Error(), http.StatusBadRequest)
+		default:
+			http.Error(w, "Unable to register user", http.StatusInternalServerError)
+		}
+		return
+	}
+
+	setSessionCookie(w, sessionToken, h.auth.SessionTTL())
+	writeJSON(w, map[string]interface{}{
+		"user": user,
+	})
+}
+
+// Login handles account sign-in and starts a session.
+func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
+	var payload credentialsRequest
+	if err := decodeJSON(r, &payload); err != nil {
+		http.Error(w, "Invalid payload", http.StatusBadRequest)
+		return
+	}
+
+	user, sessionToken, err := h.auth.Login(payload.Username, payload.Password)
+	if err != nil {
+		switch {
+		case errors.Is(err, authapp.ErrInvalidCredentials):
+			http.Error(w, err.Error(), http.StatusUnauthorized)
+		default:
+			http.Error(w, "Unable to login", http.StatusInternalServerError)
+		}
+		return
+	}
+
+	setSessionCookie(w, sessionToken, h.auth.SessionTTL())
+	writeJSON(w, map[string]interface{}{
+		"user": user,
+	})
+}
+
+// LoginGuest starts an anonymous guest session.
+func (h *Handler) LoginGuest(w http.ResponseWriter, _ *http.Request) {
+	user, sessionToken, err := h.auth.LoginGuest()
+	if err != nil {
+		http.Error(w, "Unable to login as guest", http.StatusInternalServerError)
+		return
+	}
+
+	setSessionCookie(w, sessionToken, h.auth.SessionTTL())
+	writeJSON(w, map[string]interface{}{
+		"user": user,
+	})
+}
+
+// Logout clears the current session.
+func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
+	sessionToken := sessionTokenFromRequest(r)
+	if sessionToken != "" {
+		h.auth.Logout(sessionToken)
+	}
+
+	clearSessionCookie(w)
+	writeJSON(w, map[string]string{"status": "ok"})
+}
+
+// Me returns the active authenticated user.
+func (h *Handler) Me(w http.ResponseWriter, r *http.Request) {
+	sessionToken := sessionTokenFromRequest(r)
+	if sessionToken == "" {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	user, err := h.auth.Authenticate(sessionToken)
+	if err != nil {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	writeJSON(w, map[string]interface{}{
+		"user": user,
+	})
 }
 
 // ListVideos handles GET /api/videos.
@@ -355,10 +519,303 @@ func (h *Handler) EnableTorrentStream(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
+// CreateWatchHub creates a collaborative watch hub.
+func (h *Handler) CreateWatchHub(w http.ResponseWriter, r *http.Request) {
+	user, ok := requestUser(r)
+	if !ok {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	var payload watchHubCreateRequest
+	if err := decodeJSON(r, &payload); err != nil {
+		http.Error(w, "Invalid payload", http.StatusBadRequest)
+		return
+	}
+
+	videoPath := strings.TrimSpace(payload.VideoPath)
+	if videoPath == "" {
+		http.Error(w, "videoPath is required", http.StatusBadRequest)
+		return
+	}
+
+	relPath, _, err := h.store.ResolveVideoPath(videoPath)
+	if err != nil {
+		http.Error(w, "Video not found", http.StatusNotFound)
+		return
+	}
+
+	currentTime := payload.CurrentTime
+	if math.IsNaN(currentTime) || math.IsInf(currentTime, 0) || currentTime < 0 {
+		currentTime = 0
+	}
+	playing := false
+	if payload.Playing != nil {
+		playing = *payload.Playing
+	}
+
+	hub, err := h.watch.CreateHub(user.ID, user.Username, relPath, currentTime, playing)
+	if err != nil {
+		http.Error(w, "Unable to create watch hub", http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, map[string]interface{}{
+		"hub":        hub,
+		"invitePath": fmt.Sprintf("/watch-together?hub=%s", url.QueryEscape(hub.ID)),
+	})
+}
+
+// GetWatchHub returns the current hub state.
+func (h *Handler) GetWatchHub(w http.ResponseWriter, r *http.Request) {
+	hubID := strings.TrimSpace(mux.Vars(r)["id"])
+	hub, err := h.watch.GetHub(hubID)
+	if err != nil {
+		switch {
+		case errors.Is(err, watchpartyapp.ErrHubNotFound):
+			http.Error(w, err.Error(), http.StatusNotFound)
+		default:
+			http.Error(w, err.Error(), http.StatusBadRequest)
+		}
+		return
+	}
+
+	writeJSON(w, map[string]interface{}{
+		"hub":        hub,
+		"invitePath": fmt.Sprintf("/watch-together?hub=%s", url.QueryEscape(hub.ID)),
+	})
+}
+
+// ControlWatchHub applies playback controls in a hub.
+func (h *Handler) ControlWatchHub(w http.ResponseWriter, r *http.Request) {
+	user, ok := requestUser(r)
+	if !ok {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	hubID := strings.TrimSpace(mux.Vars(r)["id"])
+	var payload watchHubControlRequest
+	if err := decodeJSON(r, &payload); err != nil {
+		http.Error(w, "Invalid payload", http.StatusBadRequest)
+		return
+	}
+
+	videoPath := strings.TrimSpace(payload.VideoPath)
+	if videoPath != "" {
+		relPath, _, err := h.store.ResolveVideoPath(videoPath)
+		if err != nil {
+			http.Error(w, "Video not found", http.StatusNotFound)
+			return
+		}
+		videoPath = relPath
+	}
+
+	event, err := h.watch.Control(hubID, user.ID, user.Username, watchpartyapp.ControlInput{
+		Action:      payload.Action,
+		VideoPath:   videoPath,
+		CurrentTime: payload.CurrentTime,
+		Playing:     payload.Playing,
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, watchpartyapp.ErrHubNotFound):
+			http.Error(w, err.Error(), http.StatusNotFound)
+		case errors.Is(err, watchpartyapp.ErrInvalidInput):
+			http.Error(w, err.Error(), http.StatusBadRequest)
+		default:
+			http.Error(w, "Unable to update hub state", http.StatusInternalServerError)
+		}
+		return
+	}
+
+	writeJSON(w, map[string]interface{}{
+		"event": event,
+	})
+}
+
+// SendWatchHubChat appends a chat message into the hub.
+func (h *Handler) SendWatchHubChat(w http.ResponseWriter, r *http.Request) {
+	user, ok := requestUser(r)
+	if !ok {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	hubID := strings.TrimSpace(mux.Vars(r)["id"])
+	var payload watchHubChatRequest
+	if err := decodeJSON(r, &payload); err != nil {
+		http.Error(w, "Invalid payload", http.StatusBadRequest)
+		return
+	}
+
+	event, err := h.watch.Chat(hubID, user.ID, user.Username, payload.Text)
+	if err != nil {
+		switch {
+		case errors.Is(err, watchpartyapp.ErrHubNotFound):
+			http.Error(w, err.Error(), http.StatusNotFound)
+		case errors.Is(err, watchpartyapp.ErrInvalidInput):
+			http.Error(w, err.Error(), http.StatusBadRequest)
+		default:
+			http.Error(w, "Unable to send chat message", http.StatusInternalServerError)
+		}
+		return
+	}
+
+	writeJSON(w, map[string]interface{}{
+		"event": event,
+	})
+}
+
+// WatchHubEvents streams SSE updates for a hub.
+func (h *Handler) WatchHubEvents(w http.ResponseWriter, r *http.Request) {
+	user, ok := requestUser(r)
+	if !ok {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	hubID := strings.TrimSpace(mux.Vars(r)["id"])
+	events, done, err := h.watch.Subscribe(hubID, user.ID, user.Username)
+	if err != nil {
+		switch {
+		case errors.Is(err, watchpartyapp.ErrHubNotFound):
+			http.Error(w, err.Error(), http.StatusNotFound)
+		default:
+			http.Error(w, err.Error(), http.StatusBadRequest)
+		}
+		return
+	}
+	defer done()
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "Streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	heartbeat := time.NewTicker(20 * time.Second)
+	defer heartbeat.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-heartbeat.C:
+			if _, err := io.WriteString(w, ": ping\n\n"); err != nil {
+				return
+			}
+			flusher.Flush()
+		case event, open := <-events:
+			if !open {
+				return
+			}
+			payload, err := json.Marshal(event)
+			if err != nil {
+				continue
+			}
+			if _, err := io.WriteString(w, "data: "); err != nil {
+				return
+			}
+			if _, err := w.Write(payload); err != nil {
+				return
+			}
+			if _, err := io.WriteString(w, "\n\n"); err != nil {
+				return
+			}
+			flusher.Flush()
+		}
+	}
+}
+
 func getPathParam(r *http.Request) string {
 	value := mux.Vars(r)["path"]
 	if value != "" {
 		return value
 	}
 	return r.URL.Query().Get("path")
+}
+
+func requestUser(r *http.Request) (authapp.User, bool) {
+	value := r.Context().Value(userContextKey)
+	user, ok := value.(authapp.User)
+	if !ok || user.ID == "" {
+		return authapp.User{}, false
+	}
+	return user, true
+}
+
+func decodeJSON(r *http.Request, out interface{}) error {
+	decoder := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
+	decoder.DisallowUnknownFields()
+	return decoder.Decode(out)
+}
+
+func writeJSON(w http.ResponseWriter, payload interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(payload)
+}
+
+func sessionTokenFromRequest(r *http.Request) string {
+	if cookie, err := r.Cookie(sessionCookieName); err == nil {
+		if token := strings.TrimSpace(cookie.Value); token != "" {
+			return token
+		}
+	}
+
+	authHeader := strings.TrimSpace(r.Header.Get("Authorization"))
+	if strings.HasPrefix(strings.ToLower(authHeader), "bearer ") {
+		return strings.TrimSpace(authHeader[7:])
+	}
+
+	return ""
+}
+
+func setSessionCookie(w http.ResponseWriter, token string, ttl time.Duration) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    token,
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   int(ttl.Seconds()),
+	})
+}
+
+func clearSessionCookie(w http.ResponseWriter) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     sessionCookieName,
+		Value:    "",
+		Path:     "/",
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+		MaxAge:   -1,
+	})
+}
+
+type credentialsRequest struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+type watchHubCreateRequest struct {
+	VideoPath   string  `json:"videoPath"`
+	CurrentTime float64 `json:"currentTime"`
+	Playing     *bool   `json:"playing"`
+}
+
+type watchHubControlRequest struct {
+	Action      string  `json:"action"`
+	VideoPath   string  `json:"videoPath"`
+	CurrentTime float64 `json:"currentTime"`
+	Playing     *bool   `json:"playing"`
+}
+
+type watchHubChatRequest struct {
+	Text string `json:"text"`
 }
