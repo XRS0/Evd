@@ -2,43 +2,43 @@
 
 :root {
   color-scheme: dark;
-  --bg: #1b1a16;
-  --surface: #ffcd74;
-  --surface-2: #9edd73;
-  --surface-3: #ff944b;
+  --bg: #22211c;
+  --surface: #c9b089;
+  --surface-2: #a9b996;
+  --surface-3: #bf9878;
   --ink: #0d0d0f;
-  --muted: #2c2a23;
+  --muted: #302d27;
   --line: #0d0d0f;
   --line-strong: #0d0d0f;
   --accent: #0d0d0f;
   --accent-soft: rgba(13, 13, 15, 0.14);
   --accent-2: #2f2c25;
-  --danger: #ff944b;
-  --success: #5ebd45;
+  --danger: #bb9069;
+  --success: #6c9060;
   --radius-sm: 3px;
   --radius-md: 5px;
   --radius-lg: 7px;
   --shadow: 5px 5px 0 #0d0d0f;
-  --focus: 0 0 0 4px rgba(158, 221, 115, 0.72);
+  --focus: 0 0 0 4px rgba(108, 144, 96, 0.62);
   --ease: cubic-bezier(0.2, 0.9, 0.2, 1);
 }
 
 :root[data-theme='light'] {
   color-scheme: light;
-  --bg: #fff6e6;
-  --surface: #ffd07a;
-  --surface-2: #b6ec8f;
-  --surface-3: #ff9f57;
+  --bg: #f5efe2;
+  --surface: #d7c19e;
+  --surface-2: #bfccb0;
+  --surface-3: #caa486;
   --ink: #0d0d0f;
-  --muted: #353027;
+  --muted: #3a352d;
   --line: #0d0d0f;
   --line-strong: #0d0d0f;
   --accent: #0d0d0f;
   --accent-soft: rgba(13, 13, 15, 0.12);
   --accent-2: #3a3429;
-  --danger: #ff9f57;
-  --success: #54af3f;
-  --focus: 0 0 0 4px rgba(84, 175, 63, 0.28);
+  --danger: #c69a72;
+  --success: #769967;
+  --focus: 0 0 0 4px rgba(118, 153, 103, 0.35);
   --shadow: 5px 5px 0 #0d0d0f;
 }
 
@@ -62,10 +62,6 @@ body {
   line-height: 1.38;
   overflow-x: hidden;
   overflow-y: auto;
-  background-image:
-    linear-gradient(90deg, rgba(255, 255, 255, 0.06) 1px, transparent 1px),
-    linear-gradient(rgba(255, 255, 255, 0.06) 1px, transparent 1px);
-  background-size: 22px 22px;
 }
 
 .auth-shell {
@@ -200,13 +196,7 @@ h3,
   top: 18px;
   left: 18px;
   border: 3px solid var(--line);
-  background: repeating-linear-gradient(
-    -45deg,
-    #ff944b,
-    #ff944b 10px,
-    #9edd73 10px,
-    #9edd73 20px
-  );
+  background: var(--surface-3);
 }
 
 .app-shell::after {
@@ -215,7 +205,7 @@ h3,
   right: 30px;
   bottom: 30px;
   border: 3px solid var(--line);
-  background: #5ebd45;
+  background: var(--surface-2);
   transform: rotate(45deg);
 }
 
@@ -233,7 +223,7 @@ h3,
   overflow: auto;
   border: 3px solid var(--line-strong);
   border-radius: var(--radius-lg);
-  background: linear-gradient(180deg, var(--surface-2) 0%, #c7ef9f 100%);
+  background: var(--surface-2);
   padding: 12px;
   display: grid;
   grid-template-rows: auto 1fr auto;
@@ -348,7 +338,7 @@ h3,
 .page-header {
   border: 3px solid var(--line-strong);
   border-radius: var(--radius-lg);
-  background: linear-gradient(110deg, var(--surface-3) 0%, #ffc08f 100%);
+  background: var(--surface-3);
   padding: 12px;
   display: flex;
   justify-content: space-between;
@@ -396,7 +386,7 @@ h3,
 .card {
   border: 3px solid var(--line-strong);
   border-radius: var(--radius-lg);
-  background: linear-gradient(160deg, var(--surface) 0%, #ffe9b8 100%);
+  background: var(--surface);
   padding: 12px;
   display: grid;
   gap: 10px;
@@ -405,7 +395,7 @@ h3,
 }
 
 .hero-card {
-  background: linear-gradient(150deg, var(--surface-3) 0%, #ffd0a7 100%);
+  background: var(--surface-3);
 }
 
 .card-head {
@@ -758,7 +748,7 @@ h3,
 .torrent-card {
   border: 3px solid var(--line-strong);
   border-radius: var(--radius-md);
-  background: linear-gradient(160deg, var(--surface-2) 0%, #d5f4b6 100%);
+  background: var(--surface-2);
   padding: 10px;
   display: grid;
   gap: 8px;
@@ -1074,7 +1064,7 @@ h3,
 
 .progress-fill {
   height: 100%;
-  background: linear-gradient(90deg, #ff944b 0%, #ffbc65 45%, #5ebd45 100%);
+  background: var(--success);
   transition: width 220ms linear;
 }
 
