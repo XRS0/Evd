@@ -29,6 +29,7 @@ func NewRouter(handler *Handler, hlsDir string) *mux.Router {
 	api.HandleFunc("/torrents", handler.ListTorrents).Methods("GET")
 	api.HandleFunc("/torrent/upload", handler.UploadTorrent).Methods("POST")
 	api.HandleFunc("/torrent/stream/{id}", handler.EnableTorrentStream).Methods("POST")
+	api.HandleFunc("/torrent/focus", handler.FocusTorrentStream).Methods("POST")
 	api.HandleFunc("/watch-hubs", handler.CreateWatchHub).Methods("POST")
 	api.HandleFunc("/watch-hubs/{id}", handler.GetWatchHub).Methods("GET")
 	api.HandleFunc("/watch-hubs/{id}/control", handler.ControlWatchHub).Methods("POST")

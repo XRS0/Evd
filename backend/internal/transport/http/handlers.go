@@ -37,6 +37,7 @@ type torrentUseCases interface {
 	List() ([]torrentdomain.Info, error)
 	AddTorrent(r io.Reader) error
 	EnableStreaming(id int) error
+	SetStreamingFocus(id, fileIndex int, currentTime, duration float64) error
 }
 
 type mediaPathStore interface {
@@ -519,6 +520,32 @@ func (h *Handler) EnableTorrentStream(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
+// FocusTorrentStream updates torrent download priority near current playback position.
+func (h *Handler) FocusTorrentStream(w http.ResponseWriter, r *http.Request) {
+	if !h.torrents.Enabled() {
+		http.Error(w, "Transmission is not configured", http.StatusServiceUnavailable)
+		return
+	}
+
+	var payload torrentFocusRequest
+	if err := decodeJSON(r, &payload); err != nil {
+		http.Error(w, "Invalid payload", http.StatusBadRequest)
+		return
+	}
+
+	if payload.TorrentID <= 0 || payload.FileIndex < 0 {
+		http.Error(w, "Invalid torrent target", http.StatusBadRequest)
+		return
+	}
+
+	if err := h.torrents.SetStreamingFocus(payload.TorrentID, payload.FileIndex, payload.CurrentTime, payload.Duration); err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+
+	writeJSON(w, map[string]string{"status": "ok"})
+}
+
 // CreateWatchHub creates a collaborative watch hub.
 func (h *Handler) CreateWatchHub(w http.ResponseWriter, r *http.Request) {
 	user, ok := requestUser(r)
@@ -818,4 +845,11 @@ type watchHubControlRequest struct {
 
 type watchHubChatRequest struct {
 	Text string `json:"text"`
+}
+
+type torrentFocusRequest struct {
+	TorrentID   int     `json:"torrentId"`
+	FileIndex   int     `json:"fileIndex"`
+	CurrentTime float64 `json:"currentTime"`
+	Duration    float64 `json:"duration"`
 }

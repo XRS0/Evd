@@ -220,6 +220,70 @@ const normalizeTorrent = (torrent) => {
   }
 }
 
+const RECENT_TORRENT_WINDOW_MS = 20 * 60 * 1000
+const TORRENT_DOWNLOADING_STATUSES = new Set(['downloading', 'download_wait', 'check_wait', 'checking'])
+
+const isTorrentDownloading = (torrent) => {
+  if (!torrent || torrent.isFinished) return false
+  const status = String(torrent.status || '').toLowerCase()
+  if (TORRENT_DOWNLOADING_STATUSES.has(status)) return true
+  return Number(torrent.rateDownload || 0) > 0 && Number(torrent.progress || 0) < 100
+}
+
+const isTorrentRecentlyImported = (torrent, nowMs = Date.now()) => {
+  const addedAtSec = Number(torrent?.addedDate || 0)
+  if (!Number.isFinite(addedAtSec) || addedAtSec <= 0) return false
+  return nowMs - (addedAtSec * 1000) <= RECENT_TORRENT_WINDOW_MS
+}
+
+const selectTorrentPreviewFiles = (files, limit = 3) => {
+  if (!Array.isArray(files)) return []
+  return files
+    .filter((file) => isPlayableVideo(file.path || file.name))
+    .sort((a, b) => {
+      const aReady = Number(Boolean(a.streamable || a.bytesCompleted > 0))
+      const bReady = Number(Boolean(b.streamable || b.bytesCompleted > 0))
+      if (aReady !== bReady) return bReady - aReady
+      if ((b.progress || 0) !== (a.progress || 0)) return (b.progress || 0) - (a.progress || 0)
+      return (b.size || 0) - (a.size || 0)
+    })
+    .slice(0, limit)
+}
+
+const sortTorrentsForDisplay = (items) => {
+  const now = Date.now()
+  return [...items].sort((a, b) => {
+    const aRecent = isTorrentRecentlyImported(a, now)
+    const bRecent = isTorrentRecentlyImported(b, now)
+    const aDownloading = isTorrentDownloading(a)
+    const bDownloading = isTorrentDownloading(b)
+
+    const aTop = aRecent || aDownloading
+    const bTop = bRecent || bDownloading
+    if (aTop !== bTop) return aTop ? -1 : 1
+
+    if (aRecent !== bRecent) return aRecent ? -1 : 1
+    if (aDownloading !== bDownloading) return aDownloading ? -1 : 1
+
+    if (aRecent && bRecent && (a.addedDate || 0) !== (b.addedDate || 0)) {
+      return (b.addedDate || 0) - (a.addedDate || 0)
+    }
+
+    if (aDownloading && bDownloading) {
+      const rateDiff = (b.rateDownload || 0) - (a.rateDownload || 0)
+      if (rateDiff !== 0) return rateDiff
+      const progressDiff = (a.progress || 0) - (b.progress || 0)
+      if (progressDiff !== 0) return progressDiff
+    }
+
+    if ((a.addedDate || 0) !== (b.addedDate || 0)) {
+      return (b.addedDate || 0) - (a.addedDate || 0)
+    }
+
+    return (b.id || 0) - (a.id || 0)
+  })
+}
+
 const buildPlayUrl = (path, follow, nonce) => {
   const params = new URLSearchParams()
   if (follow) params.set('follow', '1')
@@ -369,6 +433,7 @@ function App() {
   const vodPollRef = useRef(null)
   const torrentPollRef = useRef(null)
   const activePathRef = useRef(null)
+  const torrentFocusStateRef = useRef(new Map())
 
   const videoInputRef = useRef(null)
   const torrentInputRef = useRef(null)
@@ -631,12 +696,12 @@ function App() {
     }, 1200)
   }, [authedFetch, pollVodStatus, stopVodPolling])
 
-  const findTorrentFile = useCallback((path) => {
+  const findTorrentMatch = useCallback((path) => {
     if (!path) return null
     for (const torrent of torrents) {
       const files = Array.isArray(torrent.files) ? torrent.files : []
       const match = files.find((file) => file.path === path)
-      if (match) return match
+      if (match) return { torrentId: torrent.id, file: match }
     }
     return null
   }, [torrents])
@@ -644,7 +709,8 @@ function App() {
   const playVideo = useCallback(async (video, options = {}) => {
     if (!video?.path) return
 
-    const torrentFile = options.torrentFile || findTorrentFile(video.path)
+    const torrentMatch = options.torrentMatch || findTorrentMatch(video.path)
+    const torrentFile = torrentMatch?.file || null
     const follow = Boolean(torrentFile && torrentFile.progress < 100)
     const ext = getExt(video.path)
 
@@ -674,7 +740,7 @@ function App() {
     setPlaybackKind('vod')
     await startVod(video.path)
     setLoading(false)
-  }, [findTorrentFile, startVod, stopVodPolling])
+  }, [findTorrentMatch, startVod, stopVodPolling])
 
   const uploadVideo = useCallback(async (file) => {
     const extension = file.name.split('.').pop()?.toLowerCase()
@@ -764,6 +830,43 @@ function App() {
     }
   }, [authedFetch, pushToast])
 
+  const reportTorrentFocus = useCallback(async ({ torrentId, fileIndex, currentTime, duration, force = false }) => {
+    if (!torrentId || torrentId <= 0 || !Number.isInteger(fileIndex) || fileIndex < 0) return
+
+    const safeCurrent = Number.isFinite(currentTime) && currentTime >= 0 ? currentTime : 0
+    const safeDuration = Number.isFinite(duration) && duration > 0 ? duration : 0
+    const key = `${torrentId}:${fileIndex}`
+    const now = Date.now()
+    const previous = torrentFocusStateRef.current.get(key)
+
+    if (!force && previous) {
+      const ageMs = now - previous.at
+      const timeDelta = Math.abs(safeCurrent - previous.currentTime)
+      if (ageMs < 3500 && timeDelta < 6) {
+        return
+      }
+    }
+
+    torrentFocusStateRef.current.set(key, { at: now, currentTime: safeCurrent })
+
+    try {
+      await authedFetch('/api/torrent/focus', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          torrentId,
+          fileIndex,
+          currentTime: safeCurrent,
+          duration: safeDuration
+        })
+      })
+    } catch (err) {
+      // Ignore noisy background focus errors; playback should continue.
+    }
+  }, [authedFetch])
+
   const handleVideoSelect = useCallback((event) => {
     const file = event.target.files?.[0]
     if (file) {
@@ -780,7 +883,8 @@ function App() {
     event.target.value = ''
   }, [uploadTorrent])
 
-  const activeTorrentFile = activeVideo ? findTorrentFile(activeVideo.path) : null
+  const activeTorrentMatch = activeVideo ? findTorrentMatch(activeVideo.path) : null
+  const activeTorrentFile = activeTorrentMatch?.file || null
   const isActiveDownloading = Boolean(activeTorrentFile && activeTorrentFile.progress < 100)
   const videoTree = useMemo(() => buildVideoTree(videos), [videos])
 
@@ -804,6 +908,7 @@ function App() {
       uploadMessage,
       torrentUploading,
       torrentMessage,
+      activeTorrentMatch,
       activeTorrentFile,
       isActiveDownloading,
       libraryLoading,
@@ -818,6 +923,7 @@ function App() {
       setPlayerState,
       playVideo,
       enableTorrentStreaming,
+      reportTorrentFocus,
       handleVideoSelect,
       handleTorrentSelect,
       setPlaybackUrl,
@@ -848,6 +954,7 @@ function App() {
       uploadMessage,
       torrentUploading,
       torrentMessage,
+      activeTorrentMatch,
       activeTorrentFile,
       isActiveDownloading,
       libraryLoading,
@@ -858,6 +965,7 @@ function App() {
       updateWatchHistory,
       playVideo,
       enableTorrentStreaming,
+      reportTorrentFocus,
       handleVideoSelect,
       handleTorrentSelect,
       authedFetch,
@@ -1513,11 +1621,18 @@ function TorrentsPage() {
 
   const navigate = useNavigate()
 
+  const sortedTorrents = useMemo(() => sortTorrentsForDisplay(torrents), [torrents])
+  const activeDownloads = useMemo(() => sortedTorrents.filter((torrent) => isTorrentDownloading(torrent)).length, [sortedTorrents])
+  const recentlyImported = useMemo(() => sortedTorrents.filter((torrent) => isTorrentRecentlyImported(torrent)).length, [sortedTorrents])
+
   const handlePlay = useCallback((torrent, file) => {
     if (!file?.path) return
 
     const startPlayback = async () => {
-      await playVideo({ name: file.name, path: file.path, size: file.size }, { torrentFile: file })
+      await playVideo(
+        { name: file.name, path: file.path, size: file.size },
+        { torrentMatch: { torrentId: torrent.id, file } }
+      )
       navigate('/player')
     }
 
@@ -1562,36 +1677,101 @@ function TorrentsPage() {
 
         {torrentLoading ? (
           <SkeletonList rows={5} />
-        ) : torrents.length === 0 ? (
+        ) : sortedTorrents.length === 0 ? (
           <EmptyState title="No active torrents" description="Import a .torrent file to start downloading." />
         ) : (
-          <div className="torrent-grid">
-            {torrents.map((torrent) => (
-              <article key={torrent.id} className="torrent-card">
-                <div className="torrent-head">
-                  <div className="text-break">
-                    <h4>{displayName(torrent.name)}</h4>
-                    <p>{labelFromStatus(torrent.status)}</p>
-                  </div>
-                  <Badge tone="accent">{formatPercent(torrent.progress)}</Badge>
-                </div>
+          <>
+            <div className="torrent-summary-grid">
+              <div className="torrent-summary-tile">
+                <span>Total</span>
+                <strong>{sortedTorrents.length}</strong>
+              </div>
+              <div className="torrent-summary-tile">
+                <span>Downloading</span>
+                <strong>{activeDownloads}</strong>
+              </div>
+              <div className="torrent-summary-tile">
+                <span>New imports</span>
+                <strong>{recentlyImported}</strong>
+              </div>
+            </div>
 
-                <ProgressBar value={torrent.progress} />
+            <div className="torrent-grid">
+              {sortedTorrents.map((torrent) => {
+                const downloading = isTorrentDownloading(torrent)
+                const recent = isTorrentRecentlyImported(torrent)
+                const previewFiles = selectTorrentPreviewFiles(torrent.files)
 
-                <div className="torrent-meta">
-                  <span>{formatBytes(torrent.downloadedEver)} / {formatBytes(torrent.sizeWhenDone)}</span>
-                  <span>{formatBytes(torrent.rateDownload)}/s</span>
-                  <span>ETA {formatEta(torrent.eta)}</span>
-                </div>
+                return (
+                  <article key={torrent.id} className={cx('torrent-card', downloading && 'is-active', recent && 'is-recent')}>
+                    <div className="torrent-head">
+                      <div className="text-break">
+                        <h4>{displayName(torrent.name)}</h4>
+                        <p>{labelFromStatus(torrent.status)}</p>
+                      </div>
+                      <div className="torrent-badges">
+                        {recent && <Badge tone="success">New</Badge>}
+                        {downloading && <Badge tone="accent">Downloading</Badge>}
+                        <Badge tone={torrent.isFinished ? 'success' : 'neutral'}>{formatPercent(torrent.progress)}</Badge>
+                      </div>
+                    </div>
 
-                {torrent.files.length > 0 ? (
-                  <TorrentTree files={torrent.files} onPlay={(file) => handlePlay(torrent, file)} />
-                ) : (
-                  <p className="helper-note">Waiting for file list...</p>
-                )}
-              </article>
-            ))}
-          </div>
+                    <ProgressBar value={torrent.progress} />
+
+                    <div className="torrent-kpis">
+                      <div className="torrent-kpi">
+                        <span>Downloaded</span>
+                        <strong>{formatBytes(torrent.downloadedEver)} / {formatBytes(torrent.sizeWhenDone)}</strong>
+                      </div>
+                      <div className="torrent-kpi">
+                        <span>Speed</span>
+                        <strong>{formatBytes(torrent.rateDownload)}/s</strong>
+                      </div>
+                      <div className="torrent-kpi">
+                        <span>ETA</span>
+                        <strong>{formatEta(torrent.eta)}</strong>
+                      </div>
+                    </div>
+
+                    {previewFiles.length > 0 ? (
+                      <div className="torrent-preview-list">
+                        {previewFiles.map((file) => {
+                          const canPlay = file.streamable || (isPlayableVideo(file.path || file.name) && file.bytesCompleted > 0)
+                          return (
+                            <div key={`${torrent.id}-${file.index}`} className="torrent-preview-item">
+                              <div className="torrent-preview-main text-break">
+                                <strong>{fileTitle(file.path || file.name)}</strong>
+                                <span>{formatPercent(file.progress)} · {formatBytes(file.bytesCompleted)} / {formatBytes(file.size)}</span>
+                              </div>
+                              <Button
+                                type="button"
+                                size="sm"
+                                onClick={() => handlePlay(torrent, file)}
+                                disabled={!canPlay}
+                              >
+                                {file.progress < 100 ? 'Watch now' : 'Play'}
+                              </Button>
+                            </div>
+                          )
+                        })}
+                      </div>
+                    ) : (
+                      <p className="helper-note">Waiting for media files...</p>
+                    )}
+
+                    {torrent.files.length > 0 && (
+                      <details className="torrent-details">
+                        <summary>All files ({torrent.files.length})</summary>
+                        <div className="torrent-details-body">
+                          <TorrentTree files={torrent.files} onPlay={(file) => handlePlay(torrent, file)} />
+                        </div>
+                      </details>
+                    )}
+                  </article>
+                )
+              })}
+            </div>
+          </>
         )}
       </div>
     </SectionCard>
@@ -1644,7 +1824,9 @@ function PlayerPage() {
     setPlayerState,
     playVideo,
     isActiveDownloading,
+    activeTorrentMatch,
     activeTorrentFile,
+    reportTorrentFocus,
     setPlaybackUrl,
     vodState,
     watchHistoryByPath,
@@ -1662,6 +1844,22 @@ function PlayerPage() {
     if (!activeVideo?.path) return null
     return watchHistoryByPath.get(normalizePath(activeVideo.path)) || null
   }, [activeVideo?.path, watchHistoryByPath])
+
+  const activeTorrentId = activeTorrentMatch?.torrentId || 0
+  const activeTorrentIndex = Number.isInteger(activeTorrentMatch?.file?.index) ? activeTorrentMatch.file.index : -1
+
+  const syncTorrentFocus = useCallback((video, force = false) => {
+    if (!isActiveDownloading || !video) return
+    if (!activeTorrentId || activeTorrentIndex < 0) return
+
+    void reportTorrentFocus({
+      torrentId: activeTorrentId,
+      fileIndex: activeTorrentIndex,
+      currentTime: Number.isFinite(video.currentTime) && video.currentTime >= 0 ? video.currentTime : 0,
+      duration: Number.isFinite(video.duration) && video.duration > 0 ? video.duration : 0,
+      force
+    })
+  }, [activeTorrentId, activeTorrentIndex, isActiveDownloading, reportTorrentFocus])
 
   useEffect(() => {
     if (!activeVideo?.path) {
@@ -1740,6 +1938,7 @@ function PlayerPage() {
     const onTimeUpdate = () => {
       setCurrentTime(video.currentTime || 0)
       persistWatchProgress(video)
+      syncTorrentFocus(video, false)
     }
     const onPause = () => persistWatchProgress(video, { force: true })
     const onLoadedMetadata = () => {
@@ -1753,7 +1952,10 @@ function PlayerPage() {
         video.currentTime = resumeAt
         setCurrentTime(resumeAt)
       }
+
+      syncTorrentFocus(video, true)
     }
+    const onSeeked = () => syncTorrentFocus(video, true)
     const onError = () => {
       setPlayerState('error')
       setPlayerError('Playback error. Try reconnecting.')
@@ -1769,6 +1971,7 @@ function PlayerPage() {
     video.addEventListener('loadedmetadata', onLoadedMetadata)
     video.addEventListener('durationchange', onDuration)
     video.addEventListener('timeupdate', onTimeUpdate)
+    video.addEventListener('seeked', onSeeked)
     video.addEventListener('error', onError)
     window.addEventListener('beforeunload', onBeforeUnload)
 
@@ -1786,6 +1989,7 @@ function PlayerPage() {
       video.removeEventListener('loadedmetadata', onLoadedMetadata)
       video.removeEventListener('durationchange', onDuration)
       video.removeEventListener('timeupdate', onTimeUpdate)
+      video.removeEventListener('seeked', onSeeked)
       video.removeEventListener('error', onError)
       window.removeEventListener('beforeunload', onBeforeUnload)
     }
@@ -1793,6 +1997,7 @@ function PlayerPage() {
     persistWatchProgress,
     playbackUrl,
     retrySeed,
+    syncTorrentFocus,
     setPlayerError,
     setPlayerState
   ])
@@ -2022,8 +2227,11 @@ function WatchTogetherPage() {
     activeVideo,
     playbackUrl,
     playerState,
+    isActiveDownloading,
+    activeTorrentMatch,
     loading,
     playVideo,
+    reportTorrentFocus,
     authedFetch,
     pushToast
   } = useOutletContext()
@@ -2044,6 +2252,29 @@ function WatchTogetherPage() {
   const suppressOutgoingRef = useRef(false)
   const suppressTimerRef = useRef(null)
   const lastSeekBroadcastRef = useRef(0)
+  const lastFocusSyncRef = useRef(0)
+
+  const activeTorrentId = activeTorrentMatch?.torrentId || 0
+  const activeTorrentIndex = Number.isInteger(activeTorrentMatch?.file?.index) ? activeTorrentMatch.file.index : -1
+
+  const syncHubTorrentFocus = useCallback((video, force = false) => {
+    if (!isActiveDownloading || !video) return
+    if (!activeTorrentId || activeTorrentIndex < 0) return
+
+    const now = Date.now()
+    if (!force && now - lastFocusSyncRef.current < 3500) {
+      return
+    }
+    lastFocusSyncRef.current = now
+
+    void reportTorrentFocus({
+      torrentId: activeTorrentId,
+      fileIndex: activeTorrentIndex,
+      currentTime: Number.isFinite(video.currentTime) && video.currentTime >= 0 ? video.currentTime : 0,
+      duration: Number.isFinite(video.duration) && video.duration > 0 ? video.duration : 0,
+      force
+    })
+  }, [activeTorrentId, activeTorrentIndex, isActiveDownloading, reportTorrentFocus])
 
   const videoMap = useMemo(
     () => new Map(videos.map((video) => [normalizePath(video.path), video])),
@@ -2383,6 +2614,7 @@ function WatchTogetherPage() {
     const onPlay = () => {
       if (suppressOutgoingRef.current) return
       if (!Number.isFinite(video.duration) || video.duration <= 0) return
+      syncHubTorrentFocus(video, true)
       void sendControl('play', { currentTime: video.currentTime, playing: true })
     }
 
@@ -2398,19 +2630,26 @@ function WatchTogetherPage() {
       const now = Date.now()
       if (now - lastSeekBroadcastRef.current < 140) return
       lastSeekBroadcastRef.current = now
+      syncHubTorrentFocus(video, true)
       void sendControl('seek', { currentTime: video.currentTime })
+    }
+
+    const onTimeUpdate = () => {
+      syncHubTorrentFocus(video, false)
     }
 
     video.addEventListener('play', onPlay)
     video.addEventListener('pause', onPause)
     video.addEventListener('seeked', onSeeked)
+    video.addEventListener('timeupdate', onTimeUpdate)
 
     return () => {
       video.removeEventListener('play', onPlay)
       video.removeEventListener('pause', onPause)
       video.removeEventListener('seeked', onSeeked)
+      video.removeEventListener('timeupdate', onTimeUpdate)
     }
-  }, [hubState?.id, sendControl, playbackUrl])
+  }, [hubState?.id, playbackUrl, sendControl, syncHubTorrentFocus])
 
   const hubMembers = hubState?.members || []
   const hubMessages = hubState?.messages || []
