@@ -25,6 +25,8 @@ type Client struct {
 	HTTP        *http.Client
 	mu          sync.Mutex
 	sessionID   string
+	focusMode   streamingFocusMode
+	lastPiece   map[string]int
 	store       *filesystem.Store
 }
 
@@ -36,6 +38,7 @@ func NewClient(url, user, pass, downloadDir string, store *filesystem.Store) *Cl
 		Pass:        pass,
 		DownloadDir: downloadDir,
 		HTTP:        &http.Client{Timeout: 12 * time.Second},
+		lastPiece:   map[string]int{},
 		store:       store,
 	}
 }
@@ -147,6 +150,236 @@ func (c *Client) SetSequentialDownload(id int, enabled bool) error {
 		"ids":                []int{id},
 		"sequentialDownload": enabled,
 	})
+	return err
+}
+
+// SetStreamingFocus nudges torrent download around the current playback position.
+// When Transmission doesn't support piece-based focus, this falls back to sequential mode.
+func (c *Client) SetStreamingFocus(id, fileIndex int, positionRatio float64) error {
+	mode := c.getFocusMode()
+	if mode == streamingFocusBasic {
+		return c.setBasicFocus(id, fileIndex)
+	}
+
+	pieceInfo, err := c.fetchPieceInfo(id, fileIndex)
+	if err != nil {
+		if isPieceInfoUnsupported(err) {
+			c.setFocusMode(streamingFocusBasic)
+		}
+		return c.setBasicFocus(id, fileIndex)
+	}
+
+	startPiece, ok := pieceInfo.startPieceForRatio(positionRatio)
+	if !ok {
+		return c.setBasicFocus(id, fileIndex)
+	}
+	if c.sameFocusedPiece(id, fileIndex, startPiece) {
+		return nil
+	}
+
+	err = c.setAdvancedFocus(id, fileIndex, startPiece)
+	if err == nil {
+		c.setFocusMode(streamingFocusAdvanced)
+		c.rememberPiece(id, fileIndex, startPiece)
+		return nil
+	}
+
+	if !isUnsupportedFocusError(err) {
+		return err
+	}
+
+	c.setFocusMode(streamingFocusBasic)
+	return c.setBasicFocus(id, fileIndex)
+}
+
+type streamingFocusMode uint8
+
+const (
+	streamingFocusUnknown streamingFocusMode = iota
+	streamingFocusAdvanced
+	streamingFocusBasic
+)
+
+type pieceInfo struct {
+	length     int64
+	pieceSize  int64
+	beginPiece int
+	endPiece   int
+}
+
+func (p pieceInfo) startPieceForRatio(ratio float64) (int, bool) {
+	if p.length <= 0 || p.pieceSize <= 0 || p.endPiece < p.beginPiece {
+		return 0, false
+	}
+
+	if ratio < 0 {
+		ratio = 0
+	}
+	if ratio > 1 {
+		ratio = 1
+	}
+
+	offset := int64(float64(p.length-1) * ratio)
+	if offset < 0 {
+		offset = 0
+	}
+
+	pieceOffset := int(offset / p.pieceSize)
+	start := p.beginPiece + pieceOffset
+	if start < p.beginPiece {
+		start = p.beginPiece
+	}
+	if start > p.endPiece {
+		start = p.endPiece
+	}
+	return start, true
+}
+
+func (c *Client) fetchPieceInfo(id, fileIndex int) (pieceInfo, error) {
+	resp, err := c.request("torrent-get", map[string]interface{}{
+		"ids":    []int{id},
+		"fields": []string{"pieceSize", "files"},
+	})
+	if err != nil {
+		return pieceInfo{}, err
+	}
+
+	var args struct {
+		Torrents []struct {
+			PieceSize      int64 `json:"pieceSize"`
+			PieceSizeSnake int64 `json:"piece_size"`
+			Files          []struct {
+				Length          int64 `json:"length"`
+				BeginPiece      *int  `json:"beginPiece"`
+				BeginPieceSnake *int  `json:"begin_piece"`
+				EndPiece        *int  `json:"endPiece"`
+				EndPieceSnake   *int  `json:"end_piece"`
+			} `json:"files"`
+		} `json:"torrents"`
+	}
+	if err := json.Unmarshal(resp.Arguments, &args); err != nil {
+		return pieceInfo{}, err
+	}
+	if len(args.Torrents) == 0 {
+		return pieceInfo{}, errors.New("torrent not found")
+	}
+
+	torrentItem := args.Torrents[0]
+	if fileIndex >= len(torrentItem.Files) {
+		return pieceInfo{}, errors.New("torrent file not found")
+	}
+
+	file := torrentItem.Files[fileIndex]
+	beginPiece, hasBegin := choosePieceField(file.BeginPiece, file.BeginPieceSnake)
+	endPiece, hasEnd := choosePieceField(file.EndPiece, file.EndPieceSnake)
+	if !hasBegin || !hasEnd {
+		return pieceInfo{}, errors.New("piece boundaries are unavailable")
+	}
+
+	pieceSize := torrentItem.PieceSize
+	if pieceSize <= 0 {
+		pieceSize = torrentItem.PieceSizeSnake
+	}
+
+	return pieceInfo{
+		length:     file.Length,
+		pieceSize:  pieceSize,
+		beginPiece: beginPiece,
+		endPiece:   endPiece,
+	}, nil
+}
+
+func choosePieceField(primary, fallback *int) (int, bool) {
+	if primary != nil {
+		return *primary, true
+	}
+	if fallback != nil {
+		return *fallback, true
+	}
+	return 0, false
+}
+
+func isUnsupportedFocusError(err error) bool {
+	message := strings.ToLower(err.Error())
+	if strings.Contains(message, "sequentialdownloadfrompiece") || strings.Contains(message, "sequential_download_from_piece") {
+		return true
+	}
+	if strings.Contains(message, "priorityhigh") || strings.Contains(message, "priority_high") {
+		return true
+	}
+	return strings.Contains(message, "unknown") && strings.Contains(message, "argument")
+}
+
+func isPieceInfoUnsupported(err error) bool {
+	return strings.Contains(strings.ToLower(err.Error()), "piece boundaries are unavailable")
+}
+
+func (c *Client) getFocusMode() streamingFocusMode {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.focusMode
+}
+
+func (c *Client) setFocusMode(mode streamingFocusMode) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.focusMode = mode
+}
+
+func (c *Client) sameFocusedPiece(id, fileIndex, piece int) bool {
+	key := fmt.Sprintf("%d:%d", id, fileIndex)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	prev, ok := c.lastPiece[key]
+	return ok && prev == piece
+}
+
+func (c *Client) rememberPiece(id, fileIndex, piece int) {
+	key := fmt.Sprintf("%d:%d", id, fileIndex)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.lastPiece[key] = piece
+}
+
+func (c *Client) setBasicFocus(id, fileIndex int) error {
+	camelArgs := map[string]interface{}{
+		"ids":                []int{id},
+		"sequentialDownload": true,
+		"priorityHigh":       []int{fileIndex},
+	}
+	_, err := c.request("torrent-set", camelArgs)
+	if err == nil || !isUnsupportedFocusError(err) {
+		return err
+	}
+
+	snakeArgs := map[string]interface{}{
+		"ids":                 []int{id},
+		"sequential_download": true,
+		"priority_high":       []int{fileIndex},
+	}
+	_, err = c.request("torrent-set", snakeArgs)
+	return err
+}
+
+func (c *Client) setAdvancedFocus(id, fileIndex, startPiece int) error {
+	camelArgs := map[string]interface{}{
+		"ids":                         []int{id},
+		"sequentialDownload":          true,
+		"sequentialDownloadFromPiece": startPiece,
+		"priorityHigh":                []int{fileIndex},
+	}
+	_, err := c.request("torrent-set", camelArgs)
+	if err == nil || !isUnsupportedFocusError(err) {
+		return err
+	}
+
+	snakeArgs := map[string]interface{}{
+		"ids":                            []int{id},
+		"sequential_download":            true,
+		"sequential_download_from_piece": startPiece,
+		"priority_high":                  []int{fileIndex},
+	}
+	_, err = c.request("torrent-set", snakeArgs)
 	return err
 }
 

@@ -8,4 +8,5 @@ type Gateway interface {
 	List() ([]domain.Info, error)
 	AddTorrent(metainfo string) error
 	SetSequentialDownload(id int, enabled bool) error
+	SetStreamingFocus(id, fileIndex int, positionRatio float64) error
 }
