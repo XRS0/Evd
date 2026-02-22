@@ -1162,6 +1162,16 @@ h3,
   border-color: var(--line-strong);
 }
 
+.btn--danger {
+  background: var(--danger);
+  color: #fffef8;
+}
+
+.btn--danger:hover:not(:disabled) {
+  background: #d89b86;
+  border-color: var(--line-strong);
+}
+
 .btn--secondary {
   background: #9edd73;
 }

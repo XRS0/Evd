@@ -25,6 +25,7 @@ import (
 
 type mediaUseCases interface {
 	ListVideos() ([]mediadomain.Video, error)
+	DeleteVideo(rawPath string) error
 	StartHLS(ctx context.Context, rawPath string, follow bool) (mediadomain.JobStatus, error)
 	HLSStatus(rawPath string) (mediadomain.JobStatus, error)
 	StartMP4(ctx context.Context, rawPath string) (mediadomain.JobStatus, error)
@@ -235,6 +236,20 @@ func (h *Handler) ListVideos(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// DeleteVideo handles DELETE /api/videos/{path}.
+func (h *Handler) DeleteVideo(w http.ResponseWriter, r *http.Request) {
+	if err := h.media.DeleteVideo(getPathParam(r)); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			http.Error(w, "Video not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	writeJSON(w, map[string]bool{"ok": true})
 }
 
 // StreamVideo handles direct file streaming endpoint.

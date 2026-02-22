@@ -18,6 +18,7 @@ func NewRouter(handler *Handler, hlsDir string) *mux.Router {
 	api := r.PathPrefix("/api").Subrouter()
 	api.Use(handler.RequireAuth)
 	api.HandleFunc("/videos", handler.ListVideos).Methods("GET")
+	api.HandleFunc("/videos/{path:.*}", handler.DeleteVideo).Methods("DELETE")
 	api.HandleFunc("/stream/{path:.*}", handler.StreamVideo).Methods("GET")
 	api.HandleFunc("/play/{path:.*}", handler.StreamPlay).Methods("GET")
 	api.HandleFunc("/stream-mp4/{path:.*}", handler.StreamMP4).Methods("GET")

@@ -296,6 +296,7 @@ const buildVodStartUrl = (path) => `/api/mp4-start/${encodeURIComponent(path)}`
 const buildVodStatusUrl = (path) => `/api/mp4-status/${encodeURIComponent(path)}`
 const buildVodStreamUrl = (path) => `/api/stream-mp4/${encodeURIComponent(path)}`
 const buildDirectUrl = (path) => `/api/stream/${encodeURIComponent(path)}`
+const buildDeleteVideoUrl = (path) => `/api/videos/${encodeURIComponent(path)}`
 
 const createFolder = (name) => ({
   type: 'folder',
@@ -421,6 +422,7 @@ function App() {
   const [uploading, setUploading] = useState(false)
   const [uploadProgress, setUploadProgress] = useState(0)
   const [uploadMessage, setUploadMessage] = useState('')
+  const [deletingVideoPath, setDeletingVideoPath] = useState('')
   const [torrentUploading, setTorrentUploading] = useState(false)
   const [torrentMessage, setTorrentMessage] = useState('')
 
@@ -788,6 +790,47 @@ function App() {
     }
   }, [authedFetch, fetchVideos, pushToast])
 
+  const deleteLibraryVideo = useCallback(async (videoPath) => {
+    const normalizedTarget = normalizePath(videoPath)
+    if (!normalizedTarget) {
+      return { ok: false, error: 'Invalid file path.' }
+    }
+
+    setDeletingVideoPath(normalizedTarget)
+
+    try {
+      const res = await authedFetch(buildDeleteVideoUrl(normalizedTarget), { method: 'DELETE' })
+      if (!res.ok) {
+        const message = await readErrorMessage(res)
+        pushToast(message || 'Unable to delete video.', 'error')
+        return { ok: false, error: message || 'Unable to delete video.' }
+      }
+
+      setVideos((prev) => prev.filter((item) => normalizePath(item.path) !== normalizedTarget))
+      setWatchHistory((prev) => prev.filter((entry) => normalizePath(entry.path) !== normalizedTarget))
+
+      if (normalizePath(activePathRef.current || '') === normalizedTarget) {
+        activePathRef.current = null
+        stopVodPolling()
+        setActiveVideo(null)
+        setPlaybackUrl('')
+        setPlaybackKind('idle')
+        setPlayerState('idle')
+        setPlayerError('')
+        setVodState({ status: 'idle', url: '', progress: 0 })
+        setLoading(false)
+      }
+
+      pushToast('Video deleted from library.', 'success')
+      return { ok: true }
+    } catch (err) {
+      pushToast('Unable to delete video.', 'error')
+      return { ok: false, error: 'Unable to delete video.' }
+    } finally {
+      setDeletingVideoPath((prev) => (prev === normalizedTarget ? '' : prev))
+    }
+  }, [authedFetch, pushToast, stopVodPolling])
+
   const uploadTorrent = useCallback(async (file) => {
     if (!file || !file.name.toLowerCase().endsWith('.torrent')) {
       setTorrentMessage('Choose a .torrent file.')
@@ -906,6 +949,7 @@ function App() {
       uploading,
       uploadProgress,
       uploadMessage,
+      deletingVideoPath,
       torrentUploading,
       torrentMessage,
       activeTorrentMatch,
@@ -925,6 +969,7 @@ function App() {
       enableTorrentStreaming,
       reportTorrentFocus,
       handleVideoSelect,
+      deleteLibraryVideo,
       handleTorrentSelect,
       setPlaybackUrl,
       authedFetch,
@@ -952,6 +997,7 @@ function App() {
       uploading,
       uploadProgress,
       uploadMessage,
+      deletingVideoPath,
       torrentUploading,
       torrentMessage,
       activeTorrentMatch,
@@ -967,6 +1013,7 @@ function App() {
       enableTorrentStreaming,
       reportTorrentFocus,
       handleVideoSelect,
+      deleteLibraryVideo,
       handleTorrentSelect,
       authedFetch,
       pushToast,
@@ -1530,7 +1577,7 @@ function LibraryIndex() {
 function LibraryDetail() {
   const { id } = useParams()
   const navigate = useNavigate()
-  const { videos, playVideo, activeVideo, watchHistoryByPath } = useOutletContext()
+  const { videos, playVideo, activeVideo, watchHistoryByPath, deleteLibraryVideo, deletingVideoPath } = useOutletContext()
 
   const decoded = decodePath(id)
   const video = videos.find((item) => item.path === decoded)
@@ -1555,6 +1602,18 @@ function LibraryDetail() {
     navigate('/player')
   }
 
+  const isDeleting = normalizePath(deletingVideoPath) === normalizePath(video.path)
+
+  const handleDelete = async () => {
+    const confirmed = window.confirm(`Delete "${video.path}" from the library?\nThis removes the file from disk.`)
+    if (!confirmed) return
+
+    const result = await deleteLibraryVideo(video.path)
+    if (result?.ok) {
+      navigate('/library')
+    }
+  }
+
   return (
     <div className="stack-lg">
       <div className="overlay-head">
@@ -1564,6 +1623,9 @@ function LibraryDetail() {
         <div className="toolbar-actions">
           <Button type="button" variant="ghost" size="sm" onClick={() => navigate('/library')}>
             Close
+          </Button>
+          <Button type="button" variant="danger" size="sm" onClick={handleDelete} disabled={isDeleting}>
+            {isDeleting ? 'Deleting...' : 'Delete'}
           </Button>
           <Button type="button" variant="primary" size="sm" onClick={handlePlay}>
             {historyEntry?.currentTime > 0

@@ -95,6 +95,34 @@ func (s *Store) ResolveVideoPath(raw string) (string, string, error) {
 	return rel, full, nil
 }
 
+// DeleteVideo removes a source media file and associated derived outputs when present.
+func (s *Store) DeleteVideo(relPath string) error {
+	full := filepath.Join(s.VideosDir, filepath.FromSlash(relPath))
+	if !isWithinDir(s.VideosDir, full) {
+		return errors.New("invalid file path")
+	}
+
+	info, err := os.Stat(full)
+	if err != nil {
+		return err
+	}
+	if info.IsDir() {
+		return errors.New("invalid file path")
+	}
+
+	if err := os.Remove(full); err != nil {
+		return err
+	}
+
+	hlsDir, _, _ := s.HLSPaths(relPath)
+	_ = os.RemoveAll(hlsDir)
+
+	_, mp4Path, _ := s.MP4Paths(relPath)
+	_ = os.Remove(mp4Path)
+
+	return nil
+}
+
 // HLSPaths builds output paths and URL for HLS artifacts.
 func (s *Store) HLSPaths(relPath string) (string, string, string) {
 	base := strings.TrimSuffix(relPath, path.Ext(relPath))
