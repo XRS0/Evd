@@ -54,6 +54,7 @@ func (c *Client) List() ([]torrent.Info, error) {
 		"fields": []string{
 			"id",
 			"name",
+			"hashString",
 			"status",
 			"percentDone",
 			"rateDownload",
@@ -73,6 +74,7 @@ func (c *Client) List() ([]torrent.Info, error) {
 		Torrents []struct {
 			ID             int     `json:"id"`
 			Name           string  `json:"name"`
+			HashString     string  `json:"hashString"`
 			Status         int     `json:"status"`
 			PercentDone    float64 `json:"percentDone"`
 			RateDownload   int64   `json:"rateDownload"`
@@ -95,6 +97,13 @@ func (c *Client) List() ([]torrent.Info, error) {
 	items := make([]torrent.Info, 0, len(args.Torrents))
 	for _, t := range args.Torrents {
 		progress := int(t.PercentDone*100 + 0.5)
+		displayName := t.Name
+		if c.store != nil {
+			customTitle, err := c.store.TorrentDisplayName(t.HashString)
+			if err == nil && customTitle != "" {
+				displayName = customTitle
+			}
+		}
 		files := make([]torrent.File, 0, len(t.Files))
 		for idx, f := range t.Files {
 			rel, err := domainmedia.NormalizeVideoPath(f.Name)
@@ -118,6 +127,7 @@ func (c *Client) List() ([]torrent.Info, error) {
 		items = append(items, torrent.Info{
 			ID:             t.ID,
 			Name:           t.Name,
+			DisplayName:    displayName,
 			Status:         mapStatus(t.Status),
 			PercentDone:    t.PercentDone,
 			Progress:       progress,
@@ -135,11 +145,51 @@ func (c *Client) List() ([]torrent.Info, error) {
 }
 
 // AddTorrent adds torrent metadata to Transmission.
-func (c *Client) AddTorrent(metainfo string) error {
-	_, err := c.request("torrent-add", map[string]interface{}{
+func (c *Client) AddTorrent(metainfo, displayName string) error {
+	resp, err := c.request("torrent-add", map[string]interface{}{
 		"metainfo":     metainfo,
 		"download-dir": c.DownloadDir,
 		"paused":       false,
+	})
+	if err != nil {
+		return err
+	}
+
+	if c.store == nil || strings.TrimSpace(displayName) == "" {
+		return nil
+	}
+
+	var args struct {
+		TorrentAdded struct {
+			HashString string `json:"hashString"`
+		} `json:"torrent-added"`
+		TorrentDuplicate struct {
+			HashString string `json:"hashString"`
+		} `json:"torrent-duplicate"`
+	}
+	if err := json.Unmarshal(resp.Arguments, &args); err != nil {
+		return err
+	}
+
+	hash := strings.TrimSpace(args.TorrentAdded.HashString)
+	if hash == "" {
+		hash = strings.TrimSpace(args.TorrentDuplicate.HashString)
+	}
+	return c.store.SaveTorrentDisplayName(hash, displayName)
+}
+
+// Start resumes a stopped torrent.
+func (c *Client) Start(id int) error {
+	_, err := c.request("torrent-start", map[string]interface{}{
+		"ids": []int{id},
+	})
+	return err
+}
+
+// Stop pauses an active torrent, including seeding torrents.
+func (c *Client) Stop(id int) error {
+	_, err := c.request("torrent-stop", map[string]interface{}{
+		"ids": []int{id},
 	})
 	return err
 }

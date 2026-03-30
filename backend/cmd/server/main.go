@@ -25,7 +25,7 @@ func main() {
 	_ = mime.AddExtensionType(".m3u8", "application/vnd.apple.mpegurl")
 	_ = mime.AddExtensionType(".ts", "video/mp2t")
 
-	store := filesystem.NewStore(cfg.VideosDir, cfg.HLSDir, cfg.MP4Dir)
+	store := filesystem.NewStore(cfg.VideosDir, cfg.HLSDir, cfg.MP4Dir, cfg.TransmissionDownloadDir)
 	if err := store.EnsureDirs(); err != nil {
 		log.Fatalf("storage init failed: %v", err)
 	}

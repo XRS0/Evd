@@ -15,6 +15,7 @@ type File struct {
 type Info struct {
 	ID             int     `json:"id"`
 	Name           string  `json:"name"`
+	DisplayName    string  `json:"displayName"`
 	Status         string  `json:"status"`
 	PercentDone    float64 `json:"percentDone"`
 	Progress       int     `json:"progress"`
