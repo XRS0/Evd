@@ -5,9 +5,12 @@ import (
 	"errors"
 	"io"
 	"math"
+	"strings"
 
 	"evd/internal/domain/torrent"
 )
+
+const maxDisplayNameLength = 120
 
 // Service handles torrent use cases.
 type Service struct {
@@ -30,7 +33,7 @@ func (s *Service) List() ([]torrent.Info, error) {
 }
 
 // AddTorrent validates and submits torrent metadata.
-func (s *Service) AddTorrent(r io.Reader) error {
+func (s *Service) AddTorrent(r io.Reader, displayName string) error {
 	data, err := io.ReadAll(io.LimitReader(r, 5<<20))
 	if err != nil {
 		return err
@@ -38,8 +41,36 @@ func (s *Service) AddTorrent(r io.Reader) error {
 	if len(data) == 0 {
 		return io.ErrUnexpectedEOF
 	}
+
+	title := strings.TrimSpace(displayName)
+	if len([]rune(title)) > maxDisplayNameLength {
+		return errors.New("display name is too long")
+	}
+
 	metainfo := base64.StdEncoding.EncodeToString(data)
-	return s.gateway.AddTorrent(metainfo)
+	return s.gateway.AddTorrent(metainfo, title)
+}
+
+// Start resumes a stopped torrent in Transmission.
+func (s *Service) Start(id int) error {
+	if !s.Enabled() {
+		return errors.New("Transmission is not configured")
+	}
+	if id <= 0 {
+		return errors.New("invalid torrent id")
+	}
+	return s.gateway.Start(id)
+}
+
+// Stop pauses an active torrent or seeding session in Transmission.
+func (s *Service) Stop(id int) error {
+	if !s.Enabled() {
+		return errors.New("Transmission is not configured")
+	}
+	if id <= 0 {
+		return errors.New("invalid torrent id")
+	}
+	return s.gateway.Stop(id)
 }
 
 // EnableStreaming enables sequential download for faster preview playback.

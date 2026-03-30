@@ -2,11 +2,29 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { NavLink, Outlet, Route, Routes, useLocation, useNavigate, useOutletContext, useParams } from 'react-router-dom'
 import brandImage from '../images/img.png'
 import { getOrCreateDeviceId, loadHistoryForDevice, mergeHistoryEntry, saveHistoryForDevice } from './watchHistory'
+import {
+  ROOM_STATUS_BUFFERING,
+  ROOM_STATUS_ENDED,
+  ROOM_STATUS_PAUSED,
+  ROOM_STATUS_PLAYING,
+  SYNC_THRESHOLDS,
+  chooseDriftCorrection,
+  computeTargetPosition,
+  createClockEstimate,
+  estimateServerNow,
+  normalizePlaybackState,
+  sanitizePlaybackRate,
+  shouldAcceptPlaybackState,
+  updateClockEstimate
+} from './watchSync'
 
 const VIDEO_EXTS = ['mp4', 'mkv', 'avi', 'mov']
 const HISTORY_FLUSH_INTERVAL_MS = 2000
 const RESUME_GUARD_SECONDS = 1
 const SEEK_STEP_SECONDS = 10
+const WATCH_SYNC_PING_INTERVAL_MS = 10_000
+const WATCH_SYNC_APPLY_RETRY_MS = 250
+const WATCH_SYNC_LOG_KEY = 'evd.watchSyncDebug'
 
 const ROUTE_META = [
   {
@@ -48,6 +66,12 @@ const ROUTE_META = [
 ]
 
 const cx = (...parts) => parts.filter(Boolean).join(' ')
+
+const watchSyncLog = (...parts) => {
+  if (typeof window === 'undefined') return
+  if (window.localStorage?.getItem(WATCH_SYNC_LOG_KEY) !== '1') return
+  console.debug('[watch-sync]', ...parts)
+}
 
 const formatBytes = (bytes = 0) => {
   if (!bytes) return '0 B'
@@ -102,6 +126,8 @@ const formatPercent = (value = 0) => {
   const safe = Number.isFinite(value) ? Math.max(0, Math.min(100, Math.round(value))) : 0
   return `${safe}%`
 }
+
+const MAX_TORRENT_DISPLAY_NAME = 120
 
 const labelFromStatus = (status = '') => {
   switch (status.toLowerCase()) {
@@ -205,6 +231,7 @@ const normalizeTorrent = (torrent) => {
   return {
     id: torrent?.id ?? torrent?.ID ?? 0,
     name: torrent?.name ?? torrent?.Name ?? '',
+    displayName: torrent?.displayName ?? torrent?.DisplayName ?? torrent?.name ?? torrent?.Name ?? '',
     status: torrent?.status ?? torrent?.Status ?? '',
     percentDone,
     progress: torrent?.progress ?? torrent?.Progress ?? Math.round(percentDone * 100),
@@ -223,9 +250,13 @@ const normalizeTorrent = (torrent) => {
 const RECENT_TORRENT_WINDOW_MS = 20 * 60 * 1000
 const TORRENT_DOWNLOADING_STATUSES = new Set(['downloading', 'download_wait', 'check_wait', 'checking'])
 
+const getTorrentStatus = (torrent) => String(torrent?.status || '').toLowerCase()
+
+const isTorrentStopped = (torrent) => getTorrentStatus(torrent) === 'stopped'
+
 const isTorrentDownloading = (torrent) => {
   if (!torrent || torrent.isFinished) return false
-  const status = String(torrent.status || '').toLowerCase()
+  const status = getTorrentStatus(torrent)
   if (TORRENT_DOWNLOADING_STATUSES.has(status)) return true
   return Number(torrent.rateDownload || 0) > 0 && Number(torrent.progress || 0) < 100
 }
@@ -296,6 +327,7 @@ const buildVodStartUrl = (path) => `/api/mp4-start/${encodeURIComponent(path)}`
 const buildVodStatusUrl = (path) => `/api/mp4-status/${encodeURIComponent(path)}`
 const buildVodStreamUrl = (path) => `/api/stream-mp4/${encodeURIComponent(path)}`
 const buildDirectUrl = (path) => `/api/stream/${encodeURIComponent(path)}`
+const buildDeleteVideoUrl = (path) => `/api/videos/${encodeURIComponent(path)}`
 
 const createFolder = (name) => ({
   type: 'folder',
@@ -421,8 +453,11 @@ function App() {
   const [uploading, setUploading] = useState(false)
   const [uploadProgress, setUploadProgress] = useState(0)
   const [uploadMessage, setUploadMessage] = useState('')
+  const [deletingVideoPath, setDeletingVideoPath] = useState('')
   const [torrentUploading, setTorrentUploading] = useState(false)
   const [torrentMessage, setTorrentMessage] = useState('')
+  const [torrentActionState, setTorrentActionState] = useState({})
+  const [torrentImportDraft, setTorrentImportDraft] = useState(null)
 
   const [torrents, setTorrents] = useState([])
   const [torrentEnabled, setTorrentEnabled] = useState(true)
@@ -788,11 +823,60 @@ function App() {
     }
   }, [authedFetch, fetchVideos, pushToast])
 
-  const uploadTorrent = useCallback(async (file) => {
+  const deleteLibraryVideo = useCallback(async (videoPath) => {
+    const normalizedTarget = normalizePath(videoPath)
+    if (!normalizedTarget) {
+      return { ok: false, error: 'Invalid file path.' }
+    }
+
+    setDeletingVideoPath(normalizedTarget)
+
+    try {
+      const res = await authedFetch(buildDeleteVideoUrl(normalizedTarget), { method: 'DELETE' })
+      if (!res.ok) {
+        const message = await readErrorMessage(res)
+        pushToast(message || 'Unable to delete video.', 'error')
+        return { ok: false, error: message || 'Unable to delete video.' }
+      }
+
+      setVideos((prev) => prev.filter((item) => normalizePath(item.path) !== normalizedTarget))
+      setWatchHistory((prev) => prev.filter((entry) => normalizePath(entry.path) !== normalizedTarget))
+
+      if (normalizePath(activePathRef.current || '') === normalizedTarget) {
+        activePathRef.current = null
+        stopVodPolling()
+        setActiveVideo(null)
+        setPlaybackUrl('')
+        setPlaybackKind('idle')
+        setPlayerState('idle')
+        setPlayerError('')
+        setVodState({ status: 'idle', url: '', progress: 0 })
+        setLoading(false)
+      }
+
+      pushToast('Video deleted from library.', 'success')
+      return { ok: true }
+    } catch (err) {
+      pushToast('Unable to delete video.', 'error')
+      return { ok: false, error: 'Unable to delete video.' }
+    } finally {
+      setDeletingVideoPath((prev) => (prev === normalizedTarget ? '' : prev))
+    }
+  }, [authedFetch, pushToast, stopVodPolling])
+
+  const uploadTorrent = useCallback(async (file, rawDisplayName = '') => {
     if (!file || !file.name.toLowerCase().endsWith('.torrent')) {
       setTorrentMessage('Choose a .torrent file.')
       pushToast('Select a .torrent file.', 'error')
-      return
+      return false
+    }
+
+    const displayName = rawDisplayName.trim()
+    if (displayName.length > MAX_TORRENT_DISPLAY_NAME) {
+      const message = `Display name must be ${MAX_TORRENT_DISPLAY_NAME} characters or fewer.`
+      setTorrentMessage(message)
+      pushToast(message, 'error')
+      return false
     }
 
     setTorrentUploading(true)
@@ -801,21 +885,30 @@ function App() {
     try {
       const formData = new FormData()
       formData.append('torrent', file)
+      if (displayName) {
+        formData.append('displayName', displayName)
+      }
 
       const res = await authedFetch('/api/torrent/upload', {
         method: 'POST',
         body: formData
       })
 
-      if (!res.ok) throw new Error('Upload failed')
+      if (!res.ok) {
+        const message = await readErrorMessage(res)
+        throw new Error(message || 'Upload failed')
+      }
 
       await readJsonSafe(res)
       setTorrentMessage('Torrent added. Download started.')
       pushToast('Torrent added successfully.', 'success')
       await fetchTorrents({ silent: true })
+      return true
     } catch (err) {
-      setTorrentMessage('Torrent upload failed.')
-      pushToast('Torrent upload failed.', 'error')
+      const message = err?.message || 'Torrent upload failed.'
+      setTorrentMessage(message)
+      pushToast(message, 'error')
+      return false
     } finally {
       setTorrentUploading(false)
     }
@@ -829,6 +922,37 @@ function App() {
       pushToast('Failed to switch torrent into stream mode.', 'error')
     }
   }, [authedFetch, pushToast])
+
+  const toggleTorrentTransfer = useCallback(async (torrent) => {
+    const torrentId = Number(torrent?.id || 0)
+    if (!torrentId) return
+
+    const shouldResume = isTorrentStopped(torrent)
+    const action = shouldResume ? 'start' : 'stop'
+    const successMessage = shouldResume ? 'Torrent resumed.' : 'Torrent stopped.'
+    const fallbackError = shouldResume ? 'Unable to resume torrent.' : 'Unable to stop torrent.'
+
+    setTorrentActionState((prev) => ({ ...prev, [torrentId]: action }))
+
+    try {
+      const res = await authedFetch(`/api/torrent/${action}/${torrentId}`, { method: 'POST' })
+      if (!res.ok) {
+        const message = await readErrorMessage(res)
+        throw new Error(message || fallbackError)
+      }
+
+      pushToast(successMessage, 'success')
+      await fetchTorrents({ silent: true })
+    } catch (err) {
+      pushToast(err?.message || fallbackError, 'error')
+    } finally {
+      setTorrentActionState((prev) => {
+        const next = { ...prev }
+        delete next[torrentId]
+        return next
+      })
+    }
+  }, [authedFetch, fetchTorrents, pushToast])
 
   const reportTorrentFocus = useCallback(async ({ torrentId, fileIndex, currentTime, duration, force = false }) => {
     if (!torrentId || torrentId <= 0 || !Number.isInteger(fileIndex) || fileIndex < 0) return
@@ -878,10 +1002,13 @@ function App() {
   const handleTorrentSelect = useCallback((event) => {
     const file = event.target.files?.[0]
     if (file) {
-      void uploadTorrent(file)
+      setTorrentImportDraft({
+        file,
+        displayName: ''
+      })
     }
     event.target.value = ''
-  }, [uploadTorrent])
+  }, [])
 
   const activeTorrentMatch = activeVideo ? findTorrentMatch(activeVideo.path) : null
   const activeTorrentFile = activeTorrentMatch?.file || null
@@ -906,8 +1033,12 @@ function App() {
       uploading,
       uploadProgress,
       uploadMessage,
+      deletingVideoPath,
       torrentUploading,
       torrentMessage,
+      torrentActionState,
+      torrentImportDraft,
+      setTorrentImportDraft,
       activeTorrentMatch,
       activeTorrentFile,
       isActiveDownloading,
@@ -922,9 +1053,12 @@ function App() {
       setPlayerError,
       setPlayerState,
       playVideo,
+      uploadTorrent,
       enableTorrentStreaming,
+      toggleTorrentTransfer,
       reportTorrentFocus,
       handleVideoSelect,
+      deleteLibraryVideo,
       handleTorrentSelect,
       setPlaybackUrl,
       authedFetch,
@@ -952,8 +1086,11 @@ function App() {
       uploading,
       uploadProgress,
       uploadMessage,
+      deletingVideoPath,
       torrentUploading,
       torrentMessage,
+      torrentActionState,
+      torrentImportDraft,
       activeTorrentMatch,
       activeTorrentFile,
       isActiveDownloading,
@@ -964,9 +1101,12 @@ function App() {
       watchHistoryByPath,
       updateWatchHistory,
       playVideo,
+      uploadTorrent,
       enableTorrentStreaming,
+      toggleTorrentTransfer,
       reportTorrentFocus,
       handleVideoSelect,
+      deleteLibraryVideo,
       handleTorrentSelect,
       authedFetch,
       pushToast,
@@ -1242,7 +1382,7 @@ function Layout({ contextValue }) {
 
       <main className="main-shell">
         <header className="page-header">
-          <div>
+          <div className="page-heading">
             <h1>{routeMeta.title}</h1>
           </div>
           <div className="header-meta">
@@ -1530,7 +1670,7 @@ function LibraryIndex() {
 function LibraryDetail() {
   const { id } = useParams()
   const navigate = useNavigate()
-  const { videos, playVideo, activeVideo, watchHistoryByPath } = useOutletContext()
+  const { videos, playVideo, activeVideo, watchHistoryByPath, deleteLibraryVideo, deletingVideoPath } = useOutletContext()
 
   const decoded = decodePath(id)
   const video = videos.find((item) => item.path === decoded)
@@ -1555,6 +1695,18 @@ function LibraryDetail() {
     navigate('/player')
   }
 
+  const isDeleting = normalizePath(deletingVideoPath) === normalizePath(video.path)
+
+  const handleDelete = async () => {
+    const confirmed = window.confirm(`Delete "${video.path}" from the library?\nThis removes the file from disk.`)
+    if (!confirmed) return
+
+    const result = await deleteLibraryVideo(video.path)
+    if (result?.ok) {
+      navigate('/library')
+    }
+  }
+
   return (
     <div className="stack-lg">
       <div className="overlay-head">
@@ -1564,6 +1716,9 @@ function LibraryDetail() {
         <div className="toolbar-actions">
           <Button type="button" variant="ghost" size="sm" onClick={() => navigate('/library')}>
             Close
+          </Button>
+          <Button type="button" variant="danger" size="sm" onClick={handleDelete} disabled={isDeleting}>
+            {isDeleting ? 'Deleting...' : 'Delete'}
           </Button>
           <Button type="button" variant="primary" size="sm" onClick={handlePlay}>
             {historyEntry?.currentTime > 0
@@ -1615,8 +1770,13 @@ function TorrentsPage() {
     handleTorrentSelect,
     torrentUploading,
     torrentMessage,
+    torrentActionState,
+    torrentImportDraft,
+    setTorrentImportDraft,
     playVideo,
-    enableTorrentStreaming
+    enableTorrentStreaming,
+    toggleTorrentTransfer,
+    uploadTorrent
   } = useOutletContext()
 
   const navigate = useNavigate()
@@ -1643,138 +1803,243 @@ function TorrentsPage() {
     }
   }, [enableTorrentStreaming, navigate, playVideo])
 
+  const handleImportSubmit = useCallback(async (event) => {
+    event.preventDefault()
+    if (!torrentImportDraft?.file) return
+
+    const ok = await uploadTorrent(torrentImportDraft.file, torrentImportDraft.displayName || '')
+    if (ok) {
+      setTorrentImportDraft(null)
+    }
+  }, [setTorrentImportDraft, torrentImportDraft, uploadTorrent])
+
   return (
-    <SectionCard
-      className="torrent-shell"
-      title="Torrents"
-      actions={(
-        <div className="toolbar-actions">
-          <input
-            ref={torrentInputRef}
-            type="file"
-            accept=".torrent"
-            onChange={handleTorrentSelect}
-            hidden
-            aria-hidden="true"
-          />
-          <Button
-            type="button"
-            variant="primary"
-            onClick={() => torrentInputRef.current?.click()}
-            disabled={torrentUploading || !torrentEnabled || Boolean(torrentError)}
-            aria-label="Upload torrent file"
-          >
-            {torrentUploading ? 'Importing torrent' : 'Import torrent'}
-          </Button>
-        </div>
-      )}
-    >
-      <div className="stack-md">
-        {torrentMessage && <p className="helper-note text-break">{torrentMessage}</p>}
-
-        {!torrentEnabled && <p className="helper-note">Transmission is not configured.</p>}
-        {torrentEnabled && torrentError && <p className="helper-note text-break">{torrentError}</p>}
-
-        {torrentLoading ? (
-          <SkeletonList rows={5} />
-        ) : sortedTorrents.length === 0 ? (
-          <EmptyState title="No active torrents" description="Import a .torrent file to start downloading." />
-        ) : (
-          <>
-            <div className="torrent-summary-grid">
-              <div className="torrent-summary-tile">
-                <span>Total</span>
-                <strong>{sortedTorrents.length}</strong>
-              </div>
-              <div className="torrent-summary-tile">
-                <span>Downloading</span>
-                <strong>{activeDownloads}</strong>
-              </div>
-              <div className="torrent-summary-tile">
-                <span>New imports</span>
-                <strong>{recentlyImported}</strong>
-              </div>
-            </div>
-
-            <div className="torrent-grid">
-              {sortedTorrents.map((torrent) => {
-                const downloading = isTorrentDownloading(torrent)
-                const recent = isTorrentRecentlyImported(torrent)
-                const previewFiles = selectTorrentPreviewFiles(torrent.files)
-
-                return (
-                  <article key={torrent.id} className={cx('torrent-card', downloading && 'is-active', recent && 'is-recent')}>
-                    <div className="torrent-head">
-                      <div className="text-break">
-                        <h4>{displayName(torrent.name)}</h4>
-                        <p>{labelFromStatus(torrent.status)}</p>
-                      </div>
-                      <div className="torrent-badges">
-                        {recent && <Badge tone="success">New</Badge>}
-                        {downloading && <Badge tone="accent">Downloading</Badge>}
-                        <Badge tone={torrent.isFinished ? 'success' : 'neutral'}>{formatPercent(torrent.progress)}</Badge>
-                      </div>
-                    </div>
-
-                    <ProgressBar value={torrent.progress} />
-
-                    <div className="torrent-kpis">
-                      <div className="torrent-kpi">
-                        <span>Downloaded</span>
-                        <strong>{formatBytes(torrent.downloadedEver)} / {formatBytes(torrent.sizeWhenDone)}</strong>
-                      </div>
-                      <div className="torrent-kpi">
-                        <span>Speed</span>
-                        <strong>{formatBytes(torrent.rateDownload)}/s</strong>
-                      </div>
-                      <div className="torrent-kpi">
-                        <span>ETA</span>
-                        <strong>{formatEta(torrent.eta)}</strong>
-                      </div>
-                    </div>
-
-                    {previewFiles.length > 0 ? (
-                      <div className="torrent-preview-list">
-                        {previewFiles.map((file) => {
-                          const canPlay = file.streamable || (isPlayableVideo(file.path || file.name) && file.bytesCompleted > 0)
-                          return (
-                            <div key={`${torrent.id}-${file.index}`} className="torrent-preview-item">
-                              <div className="torrent-preview-main text-break">
-                                <strong>{fileTitle(file.path || file.name)}</strong>
-                                <span>{formatPercent(file.progress)} · {formatBytes(file.bytesCompleted)} / {formatBytes(file.size)}</span>
-                              </div>
-                              <Button
-                                type="button"
-                                size="sm"
-                                onClick={() => handlePlay(torrent, file)}
-                                disabled={!canPlay}
-                              >
-                                {file.progress < 100 ? 'Watch now' : 'Play'}
-                              </Button>
-                            </div>
-                          )
-                        })}
-                      </div>
-                    ) : (
-                      <p className="helper-note">Waiting for media files...</p>
-                    )}
-
-                    {torrent.files.length > 0 && (
-                      <details className="torrent-details">
-                        <summary>All files ({torrent.files.length})</summary>
-                        <div className="torrent-details-body">
-                          <TorrentTree files={torrent.files} onPlay={(file) => handlePlay(torrent, file)} />
-                        </div>
-                      </details>
-                    )}
-                  </article>
-                )
-              })}
-            </div>
-          </>
+    <>
+      <SectionCard
+        className="torrent-shell"
+        title="Torrents"
+        actions={(
+          <div className="toolbar-actions">
+            <input
+              ref={torrentInputRef}
+              type="file"
+              accept=".torrent"
+              onChange={handleTorrentSelect}
+              hidden
+              aria-hidden="true"
+            />
+            <Button
+              type="button"
+              variant="primary"
+              onClick={() => torrentInputRef.current?.click()}
+              disabled={torrentUploading || !torrentEnabled || Boolean(torrentError)}
+              aria-label="Upload torrent file"
+            >
+              {torrentUploading ? 'Importing torrent' : 'Import torrent'}
+            </Button>
+          </div>
         )}
-      </div>
-    </SectionCard>
+      >
+        <div className="stack-md">
+          {torrentMessage && <p className="helper-note text-break">{torrentMessage}</p>}
+
+          {!torrentEnabled && <p className="helper-note">Transmission is not configured.</p>}
+          {torrentEnabled && torrentError && <p className="helper-note text-break">{torrentError}</p>}
+
+          {torrentLoading ? (
+            <SkeletonList rows={5} />
+          ) : sortedTorrents.length === 0 ? (
+            <EmptyState title="No active torrents" description="Import a .torrent file to start downloading." />
+          ) : (
+            <>
+              <div className="torrent-summary-grid">
+                <div className="torrent-summary-tile">
+                  <span>Total</span>
+                  <strong>{sortedTorrents.length}</strong>
+                </div>
+                <div className="torrent-summary-tile">
+                  <span>Downloading</span>
+                  <strong>{activeDownloads}</strong>
+                </div>
+                <div className="torrent-summary-tile">
+                  <span>New imports</span>
+                  <strong>{recentlyImported}</strong>
+                </div>
+              </div>
+
+              <div className="torrent-grid">
+                {sortedTorrents.map((torrent) => {
+                  const downloading = isTorrentDownloading(torrent)
+                  const recent = isTorrentRecentlyImported(torrent)
+                  const previewFiles = selectTorrentPreviewFiles(torrent.files)
+                  const transferStopped = isTorrentStopped(torrent)
+                  const actionState = torrentActionState[torrent.id] || ''
+                  const actionBusy = Boolean(actionState)
+                  const actionLabel = actionState === 'start'
+                    ? 'Resuming...'
+                    : actionState === 'stop'
+                      ? 'Stopping...'
+                      : transferStopped
+                        ? 'Resume'
+                        : 'Stop'
+                  const actionTone = transferStopped ? 'secondary' : 'danger'
+                  const actionMeta = transferStopped
+                    ? 'Transfer is paused'
+                    : torrent.isFinished
+                      ? 'Seeding is active'
+                      : 'Transfer is active'
+
+                  return (
+                    <article key={torrent.id} className={cx('torrent-card', downloading && 'is-active', recent && 'is-recent')}>
+                      <div className="torrent-head">
+                        <div className="text-break">
+                          <h4>{torrent.displayName || displayName(torrent.name)}</h4>
+                          <p>{labelFromStatus(torrent.status)}</p>
+                        </div>
+                        <div className="torrent-badges">
+                          {recent && <Badge tone="success">New</Badge>}
+                          {downloading && <Badge tone="accent">Downloading</Badge>}
+                          <Badge tone={torrent.isFinished ? 'success' : 'neutral'}>{formatPercent(torrent.progress)}</Badge>
+                        </div>
+                      </div>
+
+                      <ProgressBar value={torrent.progress} />
+
+                      <div className="torrent-kpis">
+                        <div className="torrent-kpi">
+                          <span>Downloaded</span>
+                          <strong>{formatBytes(torrent.downloadedEver)} / {formatBytes(torrent.sizeWhenDone)}</strong>
+                        </div>
+                        <div className="torrent-kpi">
+                          <span>Speed</span>
+                          <strong>{formatBytes(torrent.rateDownload)}/s</strong>
+                        </div>
+                        <div className="torrent-kpi">
+                          <span>ETA</span>
+                          <strong>{formatEta(torrent.eta)}</strong>
+                        </div>
+                      </div>
+
+                      <div className="torrent-action-row">
+                        <div className="torrent-action-meta">
+                          <span>{actionMeta}</span>
+                          <strong>Added {formatDate(torrent.addedDate)}</strong>
+                        </div>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant={actionTone}
+                          onClick={() => void toggleTorrentTransfer(torrent)}
+                          disabled={actionBusy}
+                        >
+                          {actionLabel}
+                        </Button>
+                      </div>
+
+                      {previewFiles.length > 0 ? (
+                        <div className="torrent-preview-list">
+                          {previewFiles.map((file) => {
+                            const canPlay = file.streamable || (isPlayableVideo(file.path || file.name) && file.bytesCompleted > 0)
+                            return (
+                              <div key={`${torrent.id}-${file.index}`} className="torrent-preview-item">
+                                <div className="torrent-preview-main text-break">
+                                  <strong>{fileTitle(file.path || file.name)}</strong>
+                                  <span>{formatPercent(file.progress)} · {formatBytes(file.bytesCompleted)} / {formatBytes(file.size)}</span>
+                                </div>
+                                <Button
+                                  type="button"
+                                  size="sm"
+                                  onClick={() => handlePlay(torrent, file)}
+                                  disabled={!canPlay}
+                                >
+                                  {file.progress < 100 ? 'Watch now' : 'Play'}
+                                </Button>
+                              </div>
+                            )
+                          })}
+                        </div>
+                      ) : (
+                        <p className="helper-note">Waiting for media files...</p>
+                      )}
+
+                      {torrent.files.length > 0 && (
+                        <details className="torrent-details">
+                          <summary>All files ({torrent.files.length})</summary>
+                          <div className="torrent-details-body">
+                            <TorrentTree files={torrent.files} onPlay={(file) => handlePlay(torrent, file)} />
+                          </div>
+                        </details>
+                      )}
+                    </article>
+                  )
+                })}
+              </div>
+            </>
+          )}
+        </div>
+      </SectionCard>
+
+      {torrentImportDraft?.file ? (
+        <div
+          className="overlay"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Torrent import settings"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget && !torrentUploading) {
+              setTorrentImportDraft(null)
+            }
+          }}
+        >
+          <div className="overlay-panel">
+            <SectionCard
+              title="Import torrent"
+              subtitle="Add an optional short display name. Leave it empty to keep the original torrent title."
+              className="torrent-import-card"
+            >
+              <form className="stack-md" onSubmit={handleImportSubmit}>
+                <div className="torrent-import-meta">
+                  <span>Selected file</span>
+                  <strong className="text-break">{torrentImportDraft.file.name}</strong>
+                </div>
+
+                <label className="auth-field">
+                  <span>Display name (optional)</span>
+                  <input
+                    type="text"
+                    value={torrentImportDraft.displayName}
+                    onChange={(event) => setTorrentImportDraft((prev) => (prev
+                      ? { ...prev, displayName: event.target.value }
+                      : prev))}
+                    maxLength={MAX_TORRENT_DISPLAY_NAME}
+                    placeholder={displayName(torrentImportDraft.file.name)}
+                    autoFocus
+                  />
+                </label>
+
+                <p className="helper-note">
+                  Leave blank to use the title from the `.torrent` file.
+                </p>
+
+                <div className="toolbar-actions">
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    onClick={() => setTorrentImportDraft(null)}
+                    disabled={torrentUploading}
+                  >
+                    Cancel
+                  </Button>
+                  <Button type="submit" variant="primary" disabled={torrentUploading}>
+                    {torrentUploading ? 'Importing torrent' : 'Start download'}
+                  </Button>
+                </div>
+              </form>
+            </SectionCard>
+          </div>
+        </div>
+      ) : null}
+    </>
   )
 }
 
@@ -2249,6 +2514,13 @@ function WatchTogetherPage() {
 
   const videoRef = useRef(null)
   const eventSourceRef = useRef(null)
+  const pendingHubStateRef = useRef(null)
+  const latestHubStateRef = useRef(null)
+  const appliedStateVersionRef = useRef(0)
+  const clockEstimateRef = useRef(createClockEstimate())
+  const localPlaybackPhaseRef = useRef('idle')
+  const applyRetryTimerRef = useRef(null)
+  const softCorrectionTimerRef = useRef(null)
   const suppressOutgoingRef = useRef(false)
   const suppressTimerRef = useRef(null)
   const lastSeekBroadcastRef = useRef(0)
@@ -2286,11 +2558,29 @@ function WatchTogetherPage() {
     return `${window.location.origin}/watch-together?hub=${encodeURIComponent(hubState.id)}`
   }, [hubState?.id])
 
+  const hubPlaybackState = useMemo(() => normalizePlaybackState(hubState), [hubState])
+
   useEffect(() => {
     if (activeVideo?.path) {
       setSelectedPath((value) => value || activeVideo.path)
     }
   }, [activeVideo?.path])
+
+  const resetHubSyncRefs = useCallback(() => {
+    latestHubStateRef.current = null
+    pendingHubStateRef.current = null
+    appliedStateVersionRef.current = 0
+    clockEstimateRef.current = createClockEstimate()
+    localPlaybackPhaseRef.current = 'idle'
+    if (applyRetryTimerRef.current) {
+      clearTimeout(applyRetryTimerRef.current)
+      applyRetryTimerRef.current = null
+    }
+    if (softCorrectionTimerRef.current) {
+      clearTimeout(softCorrectionTimerRef.current)
+      softCorrectionTimerRef.current = null
+    }
+  }, [])
 
   const closeHubStream = useCallback(() => {
     if (eventSourceRef.current) {
@@ -2303,12 +2593,17 @@ function WatchTogetherPage() {
   useEffect(() => {
     return () => {
       closeHubStream()
+      resetHubSyncRefs()
       if (suppressTimerRef.current) {
         clearTimeout(suppressTimerRef.current)
         suppressTimerRef.current = null
       }
+      if (softCorrectionTimerRef.current) {
+        clearTimeout(softCorrectionTimerRef.current)
+        softCorrectionTimerRef.current = null
+      }
     }
-  }, [closeHubStream])
+  }, [closeHubStream, resetHubSyncRefs])
 
   const markSuppressOutgoing = useCallback((ms = 1300) => {
     suppressOutgoingRef.current = true
@@ -2353,67 +2648,179 @@ function WatchTogetherPage() {
     })
   }, [])
 
-  const applyHubEventToPlayer = useCallback(async (eventPayload) => {
-    const state = eventPayload?.hub
-    if (!state?.videoPath) return
+  const pingServerClock = useCallback(async () => {
+    const clientSentMs = Date.now()
 
-    const action = String(eventPayload?.action || eventPayload?.type || 'sync').toLowerCase()
-    const normalizedPath = normalizePath(state.videoPath)
+    try {
+      const res = await authedFetch('/api/watch-hubs/ping', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ clientTimestampMs: clientSentMs })
+      })
+      if (!res.ok) return
+
+      const pong = await readJsonSafe(res)
+      const clientReceivedMs = Date.now()
+      clockEstimateRef.current = updateClockEstimate(clockEstimateRef.current, {
+        clientSentMs,
+        clientReceivedMs,
+        serverTimestampMs: pong?.serverTimestampMs
+      })
+
+      watchSyncLog('pong', {
+        offsetMs: clockEstimateRef.current.offsetMs,
+        rttMs: clockEstimateRef.current.roundTripMs,
+        sampleCount: clockEstimateRef.current.sampleCount
+      })
+    } catch (err) {
+      watchSyncLog('ping failed', err?.message || err)
+    }
+  }, [authedFetch])
+
+  const applyHubStateToPlayer = useCallback(async (nextHub, options = {}) => {
+    if (!nextHub) return false
+
+    const playbackState = normalizePlaybackState(nextHub)
+    latestHubStateRef.current = nextHub
+
+    if (!playbackState.videoPath) return false
+    if (!options.force && !shouldAcceptPlaybackState(appliedStateVersionRef.current, playbackState)) {
+      watchSyncLog('stale snapshot ignored', {
+        incomingVersion: playbackState.stateVersion,
+        currentVersion: appliedStateVersionRef.current
+      })
+      return false
+    }
+
+    const normalizedPath = normalizePath(playbackState.videoPath)
     if (normalizePath(activeVideo?.path || '') !== normalizedPath) {
       const target = videoMap.get(normalizedPath)
       if (!target) {
-        pushToast(`Video "${state.videoPath}" is missing in local library.`, 'error')
-        return
+        pushToast(`Video "${playbackState.videoPath}" is missing in local library.`, 'error')
+        return false
       }
       await playVideo(target)
     }
 
     const video = await waitForVideoElement()
-    if (!video) return
-
-    markSuppressOutgoing(action === 'seek' ? 900 : 1600)
+    if (!video) {
+      pendingHubStateRef.current = nextHub
+      if (!applyRetryTimerRef.current) {
+        applyRetryTimerRef.current = setTimeout(() => {
+          applyRetryTimerRef.current = null
+          if (pendingHubStateRef.current) {
+            void applyHubStateToPlayer(pendingHubStateRef.current, { force: true, reason: 'video-not-ready' })
+          }
+        }, WATCH_SYNC_APPLY_RETRY_MS)
+      }
+      return false
+    }
 
     const metadataReady = await ensureVideoMetadata(video)
-    const desiredTime = Number.isFinite(state.currentTime) && state.currentTime >= 0 ? state.currentTime : 0
+    if (!metadataReady) {
+      pendingHubStateRef.current = nextHub
+      if (!applyRetryTimerRef.current) {
+        applyRetryTimerRef.current = setTimeout(() => {
+          applyRetryTimerRef.current = null
+          if (pendingHubStateRef.current) {
+            void applyHubStateToPlayer(pendingHubStateRef.current, { force: true, reason: 'metadata-not-ready' })
+          }
+        }, WATCH_SYNC_APPLY_RETRY_MS)
+      }
+      return false
+    }
 
-    if (metadataReady && isVideoSeekable(video) && Math.abs((video.currentTime || 0) - desiredTime) > 0.7) {
+    pendingHubStateRef.current = null
+    appliedStateVersionRef.current = Math.max(appliedStateVersionRef.current, playbackState.stateVersion)
+
+    const estimatedServerNowMs = estimateServerNow(clockEstimateRef.current)
+    const targetPositionSec = computeTargetPosition(playbackState, estimatedServerNowMs)
+    const actualPositionSec = Number.isFinite(video.currentTime) && video.currentTime >= 0 ? video.currentTime : 0
+    const correction = chooseDriftCorrection({
+      actualPositionSec,
+      targetPositionSec,
+      roomPlaybackRate: playbackState.playbackRate,
+      thresholds: SYNC_THRESHOLDS
+    })
+    const roomPlaybackRate = sanitizePlaybackRate(playbackState.playbackRate)
+
+    watchSyncLog('apply snapshot', {
+      reason: options.reason || 'snapshot',
+      version: playbackState.stateVersion,
+      status: playbackState.status,
+      targetPositionSec,
+      actualPositionSec,
+      driftSec: correction.driftSec,
+      mode: correction.mode
+    })
+
+    markSuppressOutgoing(correction.mode === 'hard' ? 1800 : 1400)
+    if (softCorrectionTimerRef.current) {
+      clearTimeout(softCorrectionTimerRef.current)
+      softCorrectionTimerRef.current = null
+    }
+
+    if (correction.mode === 'hard' && isVideoSeekable(video)) {
       try {
-        video.currentTime = desiredTime
+        video.currentTime = targetPositionSec
       } catch (err) {
-        // ignore seek race when stream just switched
+        watchSyncLog('hard correction seek failed', err?.message || err)
       }
-    } else if (!metadataReady && desiredTime > 0) {
-      video.addEventListener('loadedmetadata', () => {
-        try {
-          video.currentTime = desiredTime
-        } catch (err) {
-          // ignore delayed seek race
-        }
-      }, { once: true })
+    } else if (
+      playbackState.status !== ROOM_STATUS_PLAYING &&
+      isVideoSeekable(video) &&
+      Math.abs(actualPositionSec - targetPositionSec) > SYNC_THRESHOLDS.ignoreDriftSec
+    ) {
+      try {
+        video.currentTime = targetPositionSec
+      } catch (err) {
+        watchSyncLog('paused correction seek failed', err?.message || err)
+      }
     }
 
-    if (action === 'seek') {
-      return
-    }
-
-    if (action === 'play') {
-      await video.play().catch(() => {})
-      return
-    }
-
-    if (action === 'pause') {
+    if (playbackState.status === ROOM_STATUS_PLAYING) {
+      video.playbackRate = correction.mode === 'soft' ? correction.desiredPlaybackRate : roomPlaybackRate
+      if (correction.mode === 'soft') {
+        softCorrectionTimerRef.current = setTimeout(() => {
+          softCorrectionTimerRef.current = null
+          markSuppressOutgoing(500)
+          if (videoRef.current) {
+            videoRef.current.playbackRate = roomPlaybackRate
+          }
+        }, 1_200)
+      }
+      try {
+        await video.play()
+      } catch (err) {
+        watchSyncLog('play() rejected', {
+          version: playbackState.stateVersion,
+          reason: options.reason || 'snapshot',
+          message: err?.message || 'play rejected'
+        })
+      }
+    } else {
+      video.playbackRate = roomPlaybackRate
       video.pause()
-      return
     }
 
-    if (action === 'video' || action === 'sync') {
-      if (state.playing) {
-        await video.play().catch(() => {})
-      } else {
-        video.pause()
-      }
-    }
+    return true
   }, [activeVideo?.path, ensureVideoMetadata, markSuppressOutgoing, playVideo, pushToast, videoMap, waitForVideoElement])
+
+  const fetchHubSnapshot = useCallback(async (hubID) => {
+    const res = await authedFetch(`/api/watch-hubs/${encodeURIComponent(hubID)}`)
+    if (!res.ok) {
+      throw new Error(await readErrorMessage(res))
+    }
+
+    const data = await readJsonSafe(res)
+    if (!data?.hub?.id) {
+      throw new Error('Hub response is invalid.')
+    }
+
+    return data.hub
+  }, [authedFetch])
 
   const sendControl = useCallback(async (action, overrides = {}) => {
     if (!hubState?.id) return
@@ -2421,12 +2828,25 @@ function WatchTogetherPage() {
     const video = videoRef.current
     const payload = {
       action,
-      currentTime: Number.isFinite(overrides.currentTime) ? overrides.currentTime : (video?.currentTime || 0),
-      playing: typeof overrides.playing === 'boolean' ? overrides.playing : !(video?.paused ?? true)
+      expectedVersion: hubPlaybackState.stateVersion || undefined
     }
 
     if (overrides.videoPath) {
       payload.videoPath = overrides.videoPath
+    }
+
+    if (action === 'seek' || action === 'video' || Number.isFinite(overrides.currentTime)) {
+      payload.currentTime = Number.isFinite(overrides.currentTime) ? overrides.currentTime : (video?.currentTime || 0)
+    }
+
+    if (action === 'video' && typeof overrides.playing === 'boolean') {
+      payload.playing = overrides.playing
+    }
+
+    if (action === 'change_rate') {
+      payload.playbackRate = Number.isFinite(overrides.playbackRate)
+        ? overrides.playbackRate
+        : sanitizePlaybackRate(video?.playbackRate || 1)
     }
 
     if (action === 'seek' && !Number.isFinite(payload.currentTime)) return
@@ -2438,10 +2858,34 @@ function WatchTogetherPage() {
       },
       body: JSON.stringify(payload)
     })
+
+    if (res.status === 409) {
+      const rejection = await readJsonSafe(res)
+      watchSyncLog('version mismatch', rejection)
+
+      try {
+        const refreshedHub = await fetchHubSnapshot(hubState.id)
+        setHubState(refreshedHub)
+        latestHubStateRef.current = refreshedHub
+        await applyHubStateToPlayer(refreshedHub, { force: true, reason: 'version-mismatch' })
+      } catch (err) {
+        pushToast('Failed to refresh hub snapshot.', 'error')
+      }
+      return
+    }
+
     if (!res.ok) {
       pushToast('Failed to sync playback action.', 'error')
+      return
     }
-  }, [authedFetch, hubState?.id, pushToast])
+
+    const data = await readJsonSafe(res)
+    if (data?.event?.hub) {
+      setHubState(data.event.hub)
+      latestHubStateRef.current = data.event.hub
+      void applyHubStateToPlayer(data.event.hub, { reason: `command:${action}` })
+    }
+  }, [applyHubStateToPlayer, authedFetch, fetchHubSnapshot, hubPlaybackState.stateVersion, hubState?.id, pushToast])
 
   const sendChat = useCallback(async () => {
     if (!hubState?.id) return
@@ -2478,6 +2922,7 @@ function WatchTogetherPage() {
 
     stream.onopen = () => {
       setConnectionState('Connected')
+      void pingServerClock()
     }
 
     stream.onmessage = (message) => {
@@ -2485,12 +2930,14 @@ function WatchTogetherPage() {
         const payload = JSON.parse(message.data)
         const nextHub = payload?.hub
         if (!nextHub) return
+
+        latestHubStateRef.current = nextHub
         setHubState(nextHub)
 
         if (payload.type === 'chat') return
         if (payload.type === 'presence') return
-        if (payload.type === 'control' && payload.actorId === authUser?.id) return
-        void applyHubEventToPlayer(payload)
+
+        void applyHubStateToPlayer(nextHub, { reason: `event:${payload.type || 'room_state'}` })
       } catch (err) {
         // ignore malformed message
       }
@@ -2499,7 +2946,7 @@ function WatchTogetherPage() {
     stream.onerror = () => {
       setConnectionState('Reconnecting...')
     }
-  }, [applyHubEventToPlayer, authUser?.id, closeHubStream])
+  }, [applyHubStateToPlayer, closeHubStream, pingServerClock])
 
   const joinHub = useCallback(async (hubID, options = {}) => {
     const normalizedHubID = extractHubID(hubID)
@@ -2509,33 +2956,27 @@ function WatchTogetherPage() {
     setHubError('')
 
     try {
-      const res = await authedFetch(`/api/watch-hubs/${encodeURIComponent(normalizedHubID)}`)
-      if (!res.ok) {
-        setHubError(await readErrorMessage(res))
-        return
-      }
-
-      const data = await readJsonSafe(res)
-      const nextHub = data?.hub
-      if (!nextHub?.id) {
-        setHubError('Hub response is invalid.')
-        return
+      const nextHub = await fetchHubSnapshot(normalizedHubID)
+      if (nextHub.id !== latestHubStateRef.current?.id) {
+        resetHubSyncRefs()
       }
 
       setHubState(nextHub)
+      latestHubStateRef.current = nextHub
       setHubInput(nextHub.id)
-      await applyHubEventToPlayer({ type: 'sync', action: 'sync', hub: nextHub })
+      await pingServerClock()
+      await applyHubStateToPlayer(nextHub, { force: true, reason: 'join' })
       connectHubStream(nextHub.id)
 
       if (!options.keepURL) {
         navigate(`/watch-together?hub=${encodeURIComponent(nextHub.id)}`, { replace: true })
       }
     } catch (err) {
-      setHubError('Failed to join hub.')
+      setHubError(err?.message || 'Failed to join hub.')
     } finally {
       setHubBusy(false)
     }
-  }, [applyHubEventToPlayer, authedFetch, connectHubStream, navigate])
+  }, [applyHubStateToPlayer, connectHubStream, fetchHubSnapshot, navigate, pingServerClock, resetHubSyncRefs])
 
   const createHub = useCallback(async () => {
     const path = selectedPath || activeVideo?.path || ''
@@ -2578,8 +3019,12 @@ function WatchTogetherPage() {
         return
       }
 
+      resetHubSyncRefs()
       setHubState(nextHub)
+      latestHubStateRef.current = nextHub
       setHubInput(nextHub.id)
+      await pingServerClock()
+      await applyHubStateToPlayer(nextHub, { force: true, reason: 'create' })
       connectHubStream(nextHub.id)
       navigate(`/watch-together?hub=${encodeURIComponent(nextHub.id)}`, { replace: true })
       pushToast('Watch hub created.', 'success')
@@ -2588,16 +3033,17 @@ function WatchTogetherPage() {
     } finally {
       setHubBusy(false)
     }
-  }, [activeVideo?.path, authedFetch, connectHubStream, navigate, playVideo, pushToast, selectedPath, videoMap])
+  }, [activeVideo?.path, applyHubStateToPlayer, authedFetch, connectHubStream, navigate, pingServerClock, playVideo, pushToast, resetHubSyncRefs, selectedPath, videoMap])
 
   const leaveHub = useCallback(() => {
     closeHubStream()
+    resetHubSyncRefs()
     setHubState(null)
     setHubError('')
     setHubInput('')
     setChatInput('')
     navigate('/watch-together', { replace: true })
-  }, [closeHubStream, navigate])
+  }, [closeHubStream, navigate, resetHubSyncRefs])
 
   useEffect(() => {
     const queryHub = extractHubID(new URLSearchParams(location.search).get('hub') || '')
@@ -2608,20 +3054,42 @@ function WatchTogetherPage() {
   }, [hubState?.id, joinHub, location.search])
 
   useEffect(() => {
+    if (!hubState?.id) return undefined
+    void pingServerClock()
+    const timerID = setInterval(() => {
+      void pingServerClock()
+    }, WATCH_SYNC_PING_INTERVAL_MS)
+    return () => clearInterval(timerID)
+  }, [hubState?.id, pingServerClock])
+
+  useEffect(() => {
+    if (!hubState?.id) return
+    if (!playbackUrl && !pendingHubStateRef.current) return
+    const snapshot = pendingHubStateRef.current || latestHubStateRef.current
+    if (!snapshot) return
+    void applyHubStateToPlayer(snapshot, { force: true, reason: 'playback-ready' })
+  }, [activeVideo?.path, applyHubStateToPlayer, hubState?.id, playbackUrl])
+
+  useEffect(() => {
     const video = videoRef.current
     if (!video || !hubState?.id) return undefined
 
     const onPlay = () => {
       if (suppressOutgoingRef.current) return
-      if (!Number.isFinite(video.duration) || video.duration <= 0) return
+      if (localPlaybackPhaseRef.current === 'buffering' && hubPlaybackState.status !== ROOM_STATUS_PLAYING) {
+        watchSyncLog('unexpected local play while room is paused, forcing resync')
+        void applyHubStateToPlayer(latestHubStateRef.current || hubState, { force: true, reason: 'unexpected-play' })
+        return
+      }
       syncHubTorrentFocus(video, true)
-      void sendControl('play', { currentTime: video.currentTime, playing: true })
+      void sendControl('play')
     }
 
     const onPause = () => {
       if (suppressOutgoingRef.current) return
-      if (!Number.isFinite(video.duration) || video.duration <= 0) return
-      void sendControl('pause', { currentTime: video.currentTime, playing: false })
+      if (video.ended) return
+      localPlaybackPhaseRef.current = ROOM_STATUS_PAUSED
+      void sendControl('pause')
     }
 
     const onSeeked = () => {
@@ -2634,22 +3102,53 @@ function WatchTogetherPage() {
       void sendControl('seek', { currentTime: video.currentTime })
     }
 
+    const onRateChange = () => {
+      if (suppressOutgoingRef.current) return
+      if (Math.abs(sanitizePlaybackRate(video.playbackRate) - hubPlaybackState.playbackRate) < 0.01) return
+      void sendControl('change_rate', { playbackRate: video.playbackRate })
+    }
+
     const onTimeUpdate = () => {
       syncHubTorrentFocus(video, false)
+    }
+
+    const onBuffering = () => {
+      if (localPlaybackPhaseRef.current === ROOM_STATUS_BUFFERING) return
+      localPlaybackPhaseRef.current = ROOM_STATUS_BUFFERING
+      watchSyncLog('buffering start', {
+        version: appliedStateVersionRef.current,
+        actualPositionSec: video.currentTime || 0
+      })
+    }
+
+    const onPlaying = () => {
+      const wasBuffering = localPlaybackPhaseRef.current === ROOM_STATUS_BUFFERING
+      localPlaybackPhaseRef.current = ROOM_STATUS_PLAYING
+      if (!wasBuffering || !latestHubStateRef.current) return
+      watchSyncLog('buffering end, forcing resync')
+      void applyHubStateToPlayer(latestHubStateRef.current, { force: true, reason: 'buffering-end' })
     }
 
     video.addEventListener('play', onPlay)
     video.addEventListener('pause', onPause)
     video.addEventListener('seeked', onSeeked)
+    video.addEventListener('ratechange', onRateChange)
     video.addEventListener('timeupdate', onTimeUpdate)
+    video.addEventListener('waiting', onBuffering)
+    video.addEventListener('stalled', onBuffering)
+    video.addEventListener('playing', onPlaying)
 
     return () => {
       video.removeEventListener('play', onPlay)
       video.removeEventListener('pause', onPause)
       video.removeEventListener('seeked', onSeeked)
+      video.removeEventListener('ratechange', onRateChange)
       video.removeEventListener('timeupdate', onTimeUpdate)
+      video.removeEventListener('waiting', onBuffering)
+      video.removeEventListener('stalled', onBuffering)
+      video.removeEventListener('playing', onPlaying)
     }
-  }, [hubState?.id, playbackUrl, sendControl, syncHubTorrentFocus])
+  }, [applyHubStateToPlayer, hubPlaybackState.playbackRate, hubPlaybackState.status, hubState, hubState?.id, sendControl, syncHubTorrentFocus])
 
   const hubMembers = hubState?.members || []
   const hubMessages = hubState?.messages || []
@@ -2704,7 +3203,11 @@ function WatchTogetherPage() {
               type="button"
               onClick={() => {
                 if (!hubState?.id || !activeVideo?.path) return
-                void sendControl('video', { videoPath: activeVideo.path, currentTime: videoRef.current?.currentTime || 0 })
+                void sendControl('video', {
+                  videoPath: activeVideo.path,
+                  currentTime: videoRef.current?.currentTime || 0,
+                  playing: !(videoRef.current?.paused ?? true)
+                })
               }}
               disabled={!hubState?.id || !activeVideo?.path}
             >
@@ -2740,6 +3243,7 @@ function WatchTogetherPage() {
             <div className="status-list">
               <div className="status-item">Hub ID: {hubState.id}</div>
               <div className="status-item">Connection: {connectionState}</div>
+              <div className="status-item">Room status: {hubPlaybackState.status} · v{hubPlaybackState.stateVersion}</div>
               <div className="status-item">Playback status: {playerState}</div>
               <div className="status-item">Members: {hubMembers.map((member) => member.username).join(', ') || authUser?.username}</div>
             </div>

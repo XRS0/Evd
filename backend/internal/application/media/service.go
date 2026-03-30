@@ -69,6 +69,15 @@ func (s *Service) ListVideos() ([]media.Video, error) {
 	return s.store.ListVideos()
 }
 
+// DeleteVideo removes a source file from the library and clears derived artifacts.
+func (s *Service) DeleteVideo(rawPath string) error {
+	rel, _, err := s.store.ResolveVideoPath(rawPath)
+	if err != nil {
+		return err
+	}
+	return s.store.DeleteVideo(rel)
+}
+
 // StartMP4Prewarm periodically starts MP4 conversion for downloaded non-MP4 videos
 // that stayed unchanged for a short time window.
 func (s *Service) StartMP4Prewarm(ctx context.Context, interval time.Duration) {

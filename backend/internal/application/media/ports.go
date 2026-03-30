@@ -12,6 +12,7 @@ import (
 type VideoRepository interface {
 	ListVideos() ([]mediadomain.Video, error)
 	ResolveVideoPath(raw string) (string, string, error)
+	DeleteVideo(relPath string) error
 	HLSPaths(relPath string) (string, string, string)
 	MP4Paths(relPath string) (string, string, string)
 }

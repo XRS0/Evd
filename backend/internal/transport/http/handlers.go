@@ -25,6 +25,7 @@ import (
 
 type mediaUseCases interface {
 	ListVideos() ([]mediadomain.Video, error)
+	DeleteVideo(rawPath string) error
 	StartHLS(ctx context.Context, rawPath string, follow bool) (mediadomain.JobStatus, error)
 	HLSStatus(rawPath string) (mediadomain.JobStatus, error)
 	StartMP4(ctx context.Context, rawPath string) (mediadomain.JobStatus, error)
@@ -35,7 +36,9 @@ type mediaUseCases interface {
 type torrentUseCases interface {
 	Enabled() bool
 	List() ([]torrentdomain.Info, error)
-	AddTorrent(r io.Reader) error
+	AddTorrent(r io.Reader, displayName string) error
+	Start(id int) error
+	Stop(id int) error
 	EnableStreaming(id int) error
 	SetStreamingFocus(id, fileIndex int, currentTime, duration float64) error
 }
@@ -61,6 +64,7 @@ type watchPartyUseCases interface {
 	Subscribe(hubID, userID, username string) (<-chan watchpartyapp.Event, func(), error)
 	Control(hubID, userID, username string, input watchpartyapp.ControlInput) (watchpartyapp.Event, error)
 	Chat(hubID, userID, username, text string) (watchpartyapp.Event, error)
+	Ping(clientTimestampMs int64) watchpartyapp.Pong
 }
 
 type Handler struct {
@@ -235,6 +239,20 @@ func (h *Handler) ListVideos(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// DeleteVideo handles DELETE /api/videos/{path}.
+func (h *Handler) DeleteVideo(w http.ResponseWriter, r *http.Request) {
+	if err := h.media.DeleteVideo(getPathParam(r)); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			http.Error(w, "Video not found", http.StatusNotFound)
+			return
+		}
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	writeJSON(w, map[string]bool{"ok": true})
 }
 
 // StreamVideo handles direct file streaming endpoint.
@@ -488,8 +506,14 @@ func (h *Handler) UploadTorrent(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := h.torrents.AddTorrent(file); err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
+	displayName := strings.TrimSpace(r.FormValue("displayName"))
+
+	if err := h.torrents.AddTorrent(file, displayName); err != nil {
+		status := http.StatusBadGateway
+		if strings.Contains(strings.ToLower(err.Error()), "display name") {
+			status = http.StatusBadRequest
+		}
+		http.Error(w, err.Error(), status)
 		return
 	}
 
@@ -520,6 +544,16 @@ func (h *Handler) EnableTorrentStream(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
+// StartTorrent resumes a stopped torrent.
+func (h *Handler) StartTorrent(w http.ResponseWriter, r *http.Request) {
+	h.handleTorrentTransferAction(w, r, h.torrents.Start)
+}
+
+// StopTorrent pauses an active torrent or seeding session.
+func (h *Handler) StopTorrent(w http.ResponseWriter, r *http.Request) {
+	h.handleTorrentTransferAction(w, r, h.torrents.Stop)
+}
+
 // FocusTorrentStream updates torrent download priority near current playback position.
 func (h *Handler) FocusTorrentStream(w http.ResponseWriter, r *http.Request) {
 	if !h.torrents.Enabled() {
@@ -539,6 +573,27 @@ func (h *Handler) FocusTorrentStream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.torrents.SetStreamingFocus(payload.TorrentID, payload.FileIndex, payload.CurrentTime, payload.Duration); err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+
+	writeJSON(w, map[string]string{"status": "ok"})
+}
+
+func (h *Handler) handleTorrentTransferAction(w http.ResponseWriter, r *http.Request, action func(int) error) {
+	if !h.torrents.Enabled() {
+		http.Error(w, "Transmission is not configured", http.StatusServiceUnavailable)
+		return
+	}
+
+	idParam := mux.Vars(r)["id"]
+	id, err := strconv.Atoi(idParam)
+	if err != nil || id <= 0 {
+		http.Error(w, "Invalid torrent id", http.StatusBadRequest)
+		return
+	}
+
+	if err := action(id); err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
@@ -639,17 +694,26 @@ func (h *Handler) ControlWatchHub(w http.ResponseWriter, r *http.Request) {
 	}
 
 	event, err := h.watch.Control(hubID, user.ID, user.Username, watchpartyapp.ControlInput{
-		Action:      payload.Action,
-		VideoPath:   videoPath,
-		CurrentTime: payload.CurrentTime,
-		Playing:     payload.Playing,
+		Action:          payload.Action,
+		VideoPath:       videoPath,
+		CurrentTime:     payload.CurrentTime,
+		Playing:         payload.Playing,
+		PlaybackRate:    payload.PlaybackRate,
+		ExpectedVersion: payload.ExpectedVersion,
 	})
 	if err != nil {
+		var versionConflict *watchpartyapp.VersionConflictError
 		switch {
 		case errors.Is(err, watchpartyapp.ErrHubNotFound):
 			http.Error(w, err.Error(), http.StatusNotFound)
 		case errors.Is(err, watchpartyapp.ErrInvalidInput):
 			http.Error(w, err.Error(), http.StatusBadRequest)
+		case errors.As(err, &versionConflict):
+			w.WriteHeader(http.StatusConflict)
+			writeJSON(w, map[string]interface{}{
+				"reason":        versionConflict.Error(),
+				"actualVersion": versionConflict.ActualVersion,
+			})
 		default:
 			http.Error(w, "Unable to update hub state", http.StatusInternalServerError)
 		}
@@ -659,6 +723,17 @@ func (h *Handler) ControlWatchHub(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]interface{}{
 		"event": event,
 	})
+}
+
+// PingWatchHub returns a server clock sample for playback time offset estimation.
+func (h *Handler) PingWatchHub(w http.ResponseWriter, r *http.Request) {
+	var payload watchHubPingRequest
+	if err := decodeJSON(r, &payload); err != nil {
+		http.Error(w, "Invalid payload", http.StatusBadRequest)
+		return
+	}
+
+	writeJSON(w, h.watch.Ping(payload.ClientTimestampMs))
 }
 
 // SendWatchHubChat appends a chat message into the hub.
@@ -837,14 +912,20 @@ type watchHubCreateRequest struct {
 }
 
 type watchHubControlRequest struct {
-	Action      string  `json:"action"`
-	VideoPath   string  `json:"videoPath"`
-	CurrentTime float64 `json:"currentTime"`
-	Playing     *bool   `json:"playing"`
+	Action          string  `json:"action"`
+	VideoPath       string  `json:"videoPath"`
+	CurrentTime     float64 `json:"currentTime"`
+	Playing         *bool   `json:"playing"`
+	PlaybackRate    float64 `json:"playbackRate"`
+	ExpectedVersion *int64  `json:"expectedVersion"`
 }
 
 type watchHubChatRequest struct {
 	Text string `json:"text"`
+}
+
+type watchHubPingRequest struct {
+	ClientTimestampMs int64 `json:"clientTimestampMs"`
 }
 
 type torrentFocusRequest struct {
